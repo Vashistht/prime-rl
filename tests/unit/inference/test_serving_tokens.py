@@ -11,11 +11,14 @@ deltas here:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import numpy as np
 import pybase64
-from vllm.entrypoints.openai.engine.protocol import UsageInfo
-from vllm.entrypoints.serve.disagg.protocol import GenerateResponse, GenerateResponseChoice
+from vllm.entrypoints.openai.engine.protocol import RequestResponseMetadata, UsageInfo
+from vllm.entrypoints.serve.disagg.protocol import GenerateRequest, GenerateResponse, GenerateResponseChoice
+from vllm.logprobs import FlatLogprobs
+from vllm.sampling_params import SamplingParams
 
 from prime_rl.inference.vllm.routed_experts import serialize_routed_experts
 from prime_rl.inference.vllm.serving_tokens import (
@@ -23,9 +26,11 @@ from prime_rl.inference.vllm.serving_tokens import (
     PrimeRlGenerateResponseChoice,
     PrimeRlServingTokens,
     _build_usage,
+    _client_requests_compact_prompt_logprobs,
     _client_set_max_tokens,
     _FinalOutputCapture,
     _GenerateRoutedExpertsCapture,
+    _serialize_compact_prompt_logprobs,
 )
 
 
@@ -108,6 +113,120 @@ def test_client_set_max_tokens_detects_unset():
 
     body_without_sp = {"token_ids": [1, 2, 3]}
     assert asyncio.run(_client_set_max_tokens(_FakeRawRequest(body_without_sp))) is False
+
+
+def test_client_compact_prompt_logprobs_opt_in():
+    enabled = {"prime_rl_compact_prompt_logprobs": True}
+    disabled = {"prime_rl_compact_prompt_logprobs": False}
+    assert asyncio.run(_client_requests_compact_prompt_logprobs(_FakeRawRequest(enabled))) is True
+    assert asyncio.run(_client_requests_compact_prompt_logprobs(_FakeRawRequest(disabled))) is False
+
+
+def test_serialize_compact_prompt_logprobs_preserves_sampled_and_topk_columns():
+    class _NoExpandedRowsFlatLogprobs(FlatLogprobs):
+        def __iter__(self):
+            raise AssertionError("compact serialization must not expand rows")
+
+        def __getitem__(self, index):
+            raise AssertionError("compact serialization must not expand rows")
+
+    flat = _NoExpandedRowsFlatLogprobs(
+        start_indices=[0, 0, 3],
+        end_indices=[0, 3, 6],
+        # Row 1: sampled token 2 is outside top-2. Row 2: sampled token
+        # 3 is also top-1, so vLLM deliberately carries it twice.
+        token_ids=[2, 9, 8, 3, 3, 7],
+        logprobs=[-4.0, -0.1, -0.2, -0.3, -0.3, float("-inf")],
+        ranks=[3, 1, 2, 1, 1, 2],
+        decoded_tokens=[None] * 6,
+    )
+
+    compact = _serialize_compact_prompt_logprobs(flat, sequence_length=3, top_k=2)
+    sampled = np.frombuffer(
+        pybase64.b64decode(compact.sampled_logprobs.data),
+        dtype=np.float32,
+    ).reshape(compact.sampled_logprobs.shape)
+    ids = np.frombuffer(
+        pybase64.b64decode(compact.topk_token_ids.data),
+        dtype=np.int32,
+    ).reshape(compact.topk_token_ids.shape)
+    logprobs = np.frombuffer(
+        pybase64.b64decode(compact.topk_logprobs.data),
+        dtype=np.float32,
+    ).reshape(compact.topk_logprobs.shape)
+
+    np.testing.assert_allclose(sampled, [0.0, -4.0, -0.3])
+    np.testing.assert_array_equal(ids, [[0, 0], [9, 8], [3, 7]])
+    np.testing.assert_allclose(logprobs[1:], [[-0.1, -0.2], [-0.3, -9999.0]])
+    assert np.all(logprobs[0] == -1e9)
+
+
+def test_serialize_compact_prompt_logprobs_rejects_bad_row_width():
+    flat = FlatLogprobs(
+        start_indices=[0, 0],
+        end_indices=[0, 2],
+        token_ids=[2, 9],
+        logprobs=[-4.0, -0.1],
+        ranks=[3, 1],
+        decoded_tokens=[None, None],
+    )
+    with np.testing.assert_raises_regex(ValueError, "width"):
+        _serialize_compact_prompt_logprobs(flat, sequence_length=2, top_k=2)
+
+
+def test_compact_response_path_bypasses_upstream_row_expansion():
+    class _FakeServer:
+        model_config = SimpleNamespace(enable_return_routed_experts=False)
+
+        @staticmethod
+        def create_error_response(message):
+            raise AssertionError(message)
+
+    class _Output:
+        index = 0
+        token_ids = [10]
+        finish_reason = "length"
+
+    class _FinalResult:
+        prompt_token_ids = [1, 2]
+        encoder_prompt_token_ids = None
+        num_cached_tokens = 0
+        outputs = [_Output()]
+        kv_transfer_params = None
+        prompt_logprobs = FlatLogprobs(
+            start_indices=[0, 0],
+            end_indices=[0, 3],
+            token_ids=[2, 9, 8],
+            logprobs=[-4.0, -0.1, -0.2],
+            ranks=[3, 1, 2],
+            decoded_tokens=[None, None, None],
+        )
+
+    async def _results():
+        yield _FinalResult()
+
+    request = GenerateRequest(
+        token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=1, prompt_logprobs=2, flat_logprobs=True),
+    )
+    metadata = RequestResponseMetadata(request_id="request-id")
+    response = asyncio.run(
+        PrimeRlServingTokens._serve_compact_prompt_logprobs(
+            _FakeServer(),
+            request,
+            _results(),
+            "request-id",
+            metadata,
+        )
+    )
+
+    assert isinstance(response, PrimeRlGenerateResponse)
+    assert response.prompt_logprobs is None
+    assert response.prompt_logprobs_compact is not None
+    assert response.choices[0].token_ids == [10]
+    assert metadata.final_usage_info is not None
+    payload = response.model_dump(mode="json")
+    assert payload["prompt_logprobs_compact"]["topk_token_ids"]["shape"] == [2, 2]
 
 
 class _FakeOutput:

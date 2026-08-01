@@ -30,11 +30,15 @@ delegates to upstream so we track future vLLM changes for free.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable
 from functools import cached_property
 from typing import Any
 
+import numpy as np
+import pybase64
 from fastapi import Request
+from pydantic import BaseModel
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     PromptTokenUsageInfo,
@@ -48,14 +52,32 @@ from vllm.entrypoints.serve.disagg.protocol import (
 )
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.utils import get_max_tokens
+from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.utils.collection_utils import as_list
 
 from prime_rl.inference.vllm.routed_experts import RoutedExpertsCapture
 
 
 class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
     routed_experts: dict[str, Any] | None = None
+
+
+class PrimeRlBase64Tensor(BaseModel):
+    """A contiguous tensor encoded as base64 raw bytes."""
+
+    dtype: str
+    shape: list[int]
+    data: str
+
+
+class PrimeRlCompactPromptLogprobs(BaseModel):
+    """Sparse teacher scores without per-token ``Logprob`` JSON objects."""
+
+    sampled_logprobs: PrimeRlBase64Tensor
+    topk_token_ids: PrimeRlBase64Tensor
+    topk_logprobs: PrimeRlBase64Tensor
 
 
 class PrimeRlGenerateResponse(GenerateResponse):
@@ -66,6 +88,87 @@ class PrimeRlGenerateResponse(GenerateResponse):
     # router can extract per-run token counts (and cached-prefix tokens) for
     # platform billing — see https://github.com/PrimeIntellect-ai/router/pull/43.
     usage: UsageInfo | None = None
+    # Opt-in internal transport for large prompt-logprob responses. Legacy
+    # callers continue to receive the upstream ``prompt_logprobs`` field.
+    prompt_logprobs_compact: PrimeRlCompactPromptLogprobs | None = None
+
+
+def _encode_base64_tensor(array: np.ndarray) -> PrimeRlBase64Tensor:
+    compact = np.ascontiguousarray(array)
+    return PrimeRlBase64Tensor(
+        dtype=str(compact.dtype),
+        shape=list(compact.shape),
+        data=pybase64.b64encode(memoryview(compact)).decode("ascii"),
+    )
+
+
+def _serialize_compact_prompt_logprobs(
+    prompt_logprobs: FlatLogprobs,
+    *,
+    sequence_length: int,
+    top_k: int,
+) -> PrimeRlCompactPromptLogprobs:
+    """Encode vLLM's flat ``[realized, top-k...]`` rows as three tensors.
+
+    This function deliberately accesses only ``FlatLogprobs`` primitive
+    arrays. Iterating the container would rebuild a dict of ``Logprob``
+    objects at every token and recreate the serialization bottleneck this
+    transport avoids.
+    """
+    if top_k < 1:
+        raise ValueError(f"Compact prompt logprobs require positive top_k, got {top_k}.")
+    if len(prompt_logprobs.start_indices) != sequence_length or len(prompt_logprobs.end_indices) != sequence_length:
+        raise ValueError(
+            "Teacher returned flat prompt-logprob offsets for "
+            f"{len(prompt_logprobs.start_indices)} positions; expected {sequence_length}."
+        )
+    if sequence_length < 1:
+        raise ValueError("Compact prompt logprobs require at least one input token.")
+    if prompt_logprobs.start_indices[0] != 0 or prompt_logprobs.end_indices[0] != 0:
+        raise ValueError("The leading prompt token must have an empty logprob row.")
+
+    row_width = top_k + 1
+    for position in range(1, sequence_length):
+        expected_start = (position - 1) * row_width
+        expected_end = position * row_width
+        if (
+            prompt_logprobs.start_indices[position] != expected_start
+            or prompt_logprobs.end_indices[position] != expected_end
+        ):
+            actual_width = prompt_logprobs.end_indices[position] - prompt_logprobs.start_indices[position]
+            raise ValueError(
+                f"Teacher flat prompt-logprob row {position} has width {actual_width}; expected {row_width}."
+            )
+
+    expected_values = (sequence_length - 1) * row_width
+    primitive_lengths = {
+        "token_ids": len(prompt_logprobs.token_ids),
+        "logprobs": len(prompt_logprobs.logprobs),
+        "ranks": len(prompt_logprobs.ranks),
+        "decoded_tokens": len(prompt_logprobs.decoded_tokens),
+    }
+    if any(length != expected_values for length in primitive_lengths.values()):
+        raise ValueError(
+            f"Teacher flat prompt-logprob primitive lengths {primitive_lengths} do not match {expected_values}."
+        )
+
+    token_ids = np.asarray(prompt_logprobs.token_ids, dtype=np.int32).reshape(sequence_length - 1, row_width)
+    logprobs = np.asarray(prompt_logprobs.logprobs, dtype=np.float32).reshape(sequence_length - 1, row_width)
+    # Match vLLM's legacy ``clamp_prompt_logprobs`` JSON behavior.
+    logprobs[np.isneginf(logprobs)] = -9999.0
+
+    sampled = np.zeros(sequence_length, dtype=np.float32)
+    sampled[1:] = logprobs[:, 0]
+    topk_ids = np.zeros((sequence_length, top_k), dtype=np.int32)
+    topk_ids[1:] = token_ids[:, 1:]
+    topk_logprobs = np.full((sequence_length, top_k), -1e9, dtype=np.float32)
+    topk_logprobs[1:] = logprobs[:, 1:]
+
+    return PrimeRlCompactPromptLogprobs(
+        sampled_logprobs=_encode_base64_tensor(sampled),
+        topk_token_ids=_encode_base64_tensor(topk_ids),
+        topk_logprobs=_encode_base64_tensor(topk_logprobs),
+    )
 
 
 class _GenerateRoutedExpertsCapture(RoutedExpertsCapture):
@@ -149,6 +252,17 @@ async def _client_set_max_tokens(raw_request: Request | None) -> bool:
         return True
     sp = body.get("sampling_params")
     return isinstance(sp, dict) and "max_tokens" in sp
+
+
+async def _client_requests_compact_prompt_logprobs(raw_request: Request | None) -> bool:
+    """Read the Prime-RL compact-response opt-in from the cached JSON body."""
+    if raw_request is None:
+        return False
+    try:
+        body = await raw_request.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("prime_rl_compact_prompt_logprobs") is True
 
 
 class PrimeRlServingTokens(ServingTokens):
@@ -239,6 +353,21 @@ class PrimeRlServingTokens(ServingTokens):
 
         sampling_params: SamplingParams = request.sampling_params
 
+        compact_prompt_logprobs = await _client_requests_compact_prompt_logprobs(raw_request)
+        if compact_prompt_logprobs:
+            if request.stream:
+                return self.create_error_response("Compact prompt logprobs do not support streaming requests.")
+            if sampling_params.prompt_logprobs is None or sampling_params.prompt_logprobs < 1:
+                return self.create_error_response(
+                    "Compact prompt logprobs require sampling_params.prompt_logprobs to be positive."
+                )
+            if not sampling_params.flat_logprobs:
+                return self.create_error_response(
+                    "Compact prompt logprobs require sampling_params.flat_logprobs=true."
+                )
+            if sampling_params.logprobs is not None:
+                return self.create_error_response("Compact prompt logprobs do not support decode logprobs.")
+
         # Upstream ``ServingTokens.serve_tokens`` parses ``request.kv_transfer_params``
         # but never threads it into the engine, so PD disagg never fires on
         # ``/inference/v1/generate`` — decode receives an empty NIXL handshake
@@ -304,7 +433,12 @@ class PrimeRlServingTokens(ServingTokens):
             )
 
         return await self.serve_tokens_full_generator(
-            request, result_generator, request_id, model_name, request_metadata
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            request_metadata,
+            compact_prompt_logprobs=compact_prompt_logprobs,
         )
 
     async def serve_tokens_full_generator(  # type: ignore[override]
@@ -314,7 +448,16 @@ class PrimeRlServingTokens(ServingTokens):
         request_id: str,
         model_name: str,
         request_metadata: RequestResponseMetadata,
+        compact_prompt_logprobs: bool = False,
     ) -> ErrorResponse | GenerateResponse:
+        if compact_prompt_logprobs:
+            return await self._serve_compact_prompt_logprobs(
+                request,
+                result_generator,
+                request_id,
+                request_metadata,
+            )
+
         # Capture routed_experts as vLLM streams request outputs, then post-process
         # the final response into our GenerateResponse subclass so the encoded
         # experts surface in the JSON.
@@ -357,3 +500,56 @@ class PrimeRlServingTokens(ServingTokens):
             response.usage = _build_usage(final_capture.final_res)
 
         return response
+
+    async def _serve_compact_prompt_logprobs(
+        self,
+        request: GenerateRequest,
+        result_generator: AsyncGenerator[RequestOutput, None],
+        request_id: str,
+        request_metadata: RequestResponseMetadata,
+    ) -> ErrorResponse | PrimeRlGenerateResponse:
+        """Build the opt-in response before upstream expands ``FlatLogprobs``."""
+        final_res: RequestOutput | None = None
+        try:
+            async for result in result_generator:
+                final_res = result
+        except asyncio.CancelledError:
+            return self.create_error_response("Client disconnected")
+
+        if final_res is None:
+            return self.create_error_response("Teacher inference returned no output.")
+        if not isinstance(final_res.prompt_logprobs, FlatLogprobs):
+            return self.create_error_response("Teacher did not return flat prompt logprobs.")
+        if self.model_config.enable_return_routed_experts:
+            return self.create_error_response("Compact prompt logprobs do not support routed-expert capture.")
+
+        top_k = request.sampling_params.prompt_logprobs
+        assert top_k is not None
+        assert final_res.prompt_token_ids is not None
+        try:
+            compact = _serialize_compact_prompt_logprobs(
+                final_res.prompt_logprobs,
+                sequence_length=len(final_res.prompt_token_ids),
+                top_k=top_k,
+            )
+        except ValueError as error:
+            return self.create_error_response(str(error))
+
+        choices = [
+            PrimeRlGenerateResponseChoice(
+                index=output.index,
+                finish_reason=output.finish_reason if output.finish_reason else "stop",
+                token_ids=as_list(output.token_ids),
+            )
+            for output in final_res.outputs
+        ]
+        usage = _build_usage(final_res)
+        request_metadata.final_usage_info = usage
+        return PrimeRlGenerateResponse(
+            request_id=request_id,
+            choices=choices,
+            usage=usage,
+            prompt_logprobs=None,
+            prompt_logprobs_compact=compact,
+            kv_transfer_params=final_res.kv_transfer_params,
+        )

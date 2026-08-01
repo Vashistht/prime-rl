@@ -6,9 +6,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import cycle
+from math import prod
 from pathlib import Path
 
 import orjson
+import pybase64
 import verifiers as vf
 from verifiers.utils.client_utils import setup_openai_client
 from verifiers.utils.save_utils import make_serializable
@@ -118,6 +120,40 @@ class TeacherPrefillScores:
     topk_logprobs: EncodedTensor | None = None
 
 
+def _decode_compact_tensor(
+    payload: object,
+    *,
+    name: str,
+    expected_dtype: str,
+    expected_shape: list[int],
+) -> bytes:
+    if not isinstance(payload, dict):
+        raise ValueError(f"Teacher compact {name} must be an object.")
+    dtype = payload.get("dtype")
+    shape = payload.get("shape")
+    encoded = payload.get("data")
+    if dtype != expected_dtype:
+        raise ValueError(f"Teacher compact {name} has dtype {dtype!r}; expected {expected_dtype!r}.")
+    if (
+        not isinstance(shape, list)
+        or any(type(dimension) is not int for dimension in shape)
+        or shape != expected_shape
+    ):
+        raise ValueError(f"Teacher compact {name} has shape {shape!r}; expected {expected_shape!r}.")
+    if not isinstance(encoded, str):
+        raise ValueError(f"Teacher compact {name} data must be a base64 string.")
+    try:
+        decoded = pybase64.b64decode(encoded, validate=True)
+    except Exception as error:
+        raise ValueError(f"Teacher compact {name} contains invalid base64 data.") from error
+    expected_nbytes = prod(expected_shape) * 4
+    if len(decoded) != expected_nbytes:
+        raise ValueError(
+            f"Teacher compact {name} decoded to {len(decoded)} bytes; expected {expected_nbytes}."
+        )
+    return decoded
+
+
 async def compute_teacher_logprobs(
     clients: list[vf.ClientConfig],
     model_name: str,
@@ -135,8 +171,13 @@ async def compute_teacher_logprobs(
     import httpx
     from vllm.entrypoints.serve.disagg.protocol import GenerateResponse
 
-    async def _compute_single(client_config: vf.ClientConfig, sample: TrainingSample) -> TeacherPrefillScores:
-        client = setup_openai_client(client_config)
+    if not samples:
+        return []
+    if not clients:
+        raise ValueError("Teacher scoring requires at least one client.")
+    teacher_clients = [setup_openai_client(client_config) for client_config in clients]
+
+    async def _compute_single(client, sample: TrainingSample) -> TeacherPrefillScores:
 
         # Two escape hatches from ``AsyncOpenAI.post``:
         #   1. URL — ``/inference/v1/generate`` is mounted at server root, not
@@ -150,26 +191,91 @@ async def compute_teacher_logprobs(
         #      (preserving ``auth_headers``, retries, timeouts, idempotency
         #      keys) and just hands us the raw response to validate ourselves.
         base = str(client.base_url).rstrip("/").removesuffix("/v1")
+        sampling_params = {
+            "max_tokens": 1,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            # Teacher scoring only consumes token ids and logprobs. Avoid
+            # constructing decoded strings for every sparse support item.
+            "detokenize": False,
+            "prompt_logprobs": top_k if top_k is not None else 1,
+        }
+        body = {
+            "model": model_name,
+            "token_ids": list(sample.prompt_ids) + list(sample.completion_ids),
+            "sampling_params": sampling_params,
+        }
+        if top_k is not None:
+            # vLLM keeps [realized token, true top-k...] in primitive flat
+            # arrays. Prime-RL's opt-in response transports those arrays
+            # directly; a vLLM 0.22 server without the Prime-RL extension
+            # ignores the marker and returns expanded JSON parsed below.
+            sampling_params["flat_logprobs"] = True
+            body["prime_rl_compact_prompt_logprobs"] = True
+
         http_response = await client.post(
             f"{base}/inference/v1/generate",
             cast_to=httpx.Response,
-            body={
-                "model": model_name,
-                "token_ids": list(sample.prompt_ids) + list(sample.completion_ids),
-                "sampling_params": {
-                    "max_tokens": 1,
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "prompt_logprobs": top_k if top_k is not None else 1,
-                },
-            },
+            body=body,
         )
+        expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
+
+        # Detect the object-valued compact field without first parsing a
+        # possible legacy multi-gigabyte JSON response. Whitespace is allowed
+        # around the colon for test servers and non-default JSON renderers.
+        marker = b'"prompt_logprobs_compact"'
+        marker_index = http_response.content.find(marker)
+        compact_response = False
+        if marker_index >= 0:
+            cursor = marker_index + len(marker)
+            while cursor < len(http_response.content) and http_response.content[cursor] in b" \t\r\n:":
+                cursor += 1
+            compact_response = cursor < len(http_response.content) and http_response.content[cursor] == ord("{")
+
+        if compact_response:
+            payload = orjson.loads(http_response.content)
+            compact = payload.get("prompt_logprobs_compact")
+            if not isinstance(compact, dict):
+                raise ValueError("Teacher compact prompt-logprob response is malformed.")
+            sampled_data = _decode_compact_tensor(
+                compact.get("sampled_logprobs"),
+                name="sampled_logprobs",
+                expected_dtype="float32",
+                expected_shape=[expected_len],
+            )
+            assert top_k is not None
+            topk_shape = [expected_len, top_k]
+            topk_ids_data = _decode_compact_tensor(
+                compact.get("topk_token_ids"),
+                name="topk_token_ids",
+                expected_dtype="int32",
+                expected_shape=topk_shape,
+            )
+            topk_logprobs_data = _decode_compact_tensor(
+                compact.get("topk_logprobs"),
+                name="topk_logprobs",
+                expected_dtype="float32",
+                expected_shape=topk_shape,
+            )
+
+            import numpy as np
+
+            return TeacherPrefillScores(
+                logprobs=np.frombuffer(sampled_data, dtype=np.float32).tolist(),
+                topk_token_ids=EncodedTensor(dtype="int32", shape=topk_shape, data=topk_ids_data),
+                topk_logprobs=EncodedTensor(dtype="float32", shape=topk_shape, data=topk_logprobs_data),
+            )
+
         response = GenerateResponse.model_validate_json(http_response.content)
         # ``prompt_logprobs[i]`` is a ``{token_id: Logprob}`` dict for tokens
         # the engine could score, or ``None`` for the leading token which has
         # no preceding context. Flatten to ``list[float]`` with 0.0 in the
         # unscored slot.
-        flat: list[float] = []
+        rows = response.prompt_logprobs or []
+        if len(rows) != expected_len:
+            raise ValueError(f"Teacher returned {len(rows)} score rows for {expected_len} input tokens.")
+
+        flat = [0.0] * expected_len
         topk_ids: list[list[int]] = []
         topk_logprobs: list[list[float]] = []
 
@@ -181,9 +287,8 @@ async def compute_teacher_logprobs(
             return float(logprob) if logprob is not None else float("-inf")
 
         input_ids = sample.prompt_ids + sample.completion_ids
-        for position, entry in enumerate(response.prompt_logprobs or []):
+        for position, entry in enumerate(rows):
             if not entry:
-                flat.append(0.0)
                 if top_k is not None:
                     topk_ids.append([0] * top_k)
                     topk_logprobs.append([-1e9] * top_k)
@@ -197,7 +302,7 @@ async def compute_teacher_logprobs(
                     f"Teacher prompt-logprob row {position} does not contain realized token {realized_token_id}."
                 )
             lp = _logprob(realized)
-            flat.append(float(lp) if lp is not None else 0.0)
+            flat[position] = float(lp) if lp is not None else 0.0
             if top_k is not None:
                 ranked = sorted(entry.items(), key=lambda item: _sortable_logprob(item[1]), reverse=True)[:top_k]
                 if len(ranked) != top_k:
@@ -205,14 +310,8 @@ async def compute_teacher_logprobs(
                         f"Teacher returned only {len(ranked)} logprobs for a requested top-k of {top_k}. "
                         "Set the teacher inference server's max_logprobs to at least opd_top_k."
                     )
-                ids = [int(token_id) for token_id, _ in ranked]
-                lps = [_sortable_logprob(value) for _, value in ranked]
-                topk_ids.append(ids)
-                topk_logprobs.append(lps)
-
-        expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
-        if len(flat) != expected_len:
-            raise ValueError(f"Teacher returned {len(flat)} score rows for {expected_len} input tokens.")
+                topk_ids.append([int(token_id) for token_id, _ in ranked])
+                topk_logprobs.append([_sortable_logprob(value) for _, value in ranked])
 
         if top_k is None:
             return TeacherPrefillScores(logprobs=flat)
@@ -225,7 +324,15 @@ async def compute_teacher_logprobs(
             topk_logprobs=EncodedTensor.from_numpy(np.asarray(topk_logprobs, dtype=np.float32)),
         )
 
-    return await asyncio.gather(*[_compute_single(client, sample) for client, sample in zip(cycle(clients), samples)])
+    try:
+        async with asyncio.TaskGroup() as task_group:
+            tasks = [
+                task_group.create_task(_compute_single(client, sample))
+                for client, sample in zip(cycle(teacher_clients), samples)
+            ]
+        return [task.result() for task in tasks]
+    finally:
+        await asyncio.gather(*(client.close() for client in teacher_clients), return_exceptions=True)
 
 
 def get_weight_dir(output_dir: Path, step: int, check_exists: bool = True, wait_timeout: int | None = None) -> Path:
