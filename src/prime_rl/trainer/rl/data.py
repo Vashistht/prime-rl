@@ -29,6 +29,8 @@ class TensorMicroBatch(TypedDict):
     rewards: Float[Tensor, "batch seq"] | None
     inference_logprobs: Float[Tensor, "batch seq"]
     teacher_logprobs: Float[Tensor, "batch seq"] | None
+    teacher_topk_token_ids: Int[Tensor, "batch seq k"] | None
+    teacher_topk_logprobs: Float[Tensor, "batch seq k"] | None
     loss_mask: Bool[Tensor, "batch seq"]
     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
     env_names: list[str]
@@ -125,6 +127,8 @@ class FakeDataLoader:
             "rewards": None,
             "inference_logprobs": inference_logprobs.unsqueeze(0),
             "teacher_logprobs": None,
+            "teacher_topk_token_ids": None,
+            "teacher_topk_logprobs": None,
             "temperatures": torch.ones(input_ids.shape[0]).unsqueeze(0),
             "env_names": ["fake"] * input_ids.shape[0],
             "sequence_lengths": sequence_lengths,
@@ -156,6 +160,8 @@ class FakeDataLoader:
             "rewards": None,
             "inference_logprobs": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "teacher_logprobs": None,
+            "teacher_topk_token_ids": None,
+            "teacher_topk_logprobs": None,
             "temperatures": torch.ones(self.seq_len).unsqueeze(0),
             "env_names": ["fake"] * self.seq_len,
             "sequence_lengths": [self.seq_len],
@@ -243,6 +249,17 @@ class DataLoader:
                 .to(torch.int32)
                 .unsqueeze(0)
             )
+
+        def _decode_encoded(payload, dtype: torch.dtype) -> Tensor | None:
+            if payload is None:
+                return None
+            return (
+                torch.frombuffer(bytearray(payload.data), dtype=_torch_dtype(payload.dtype))
+                .reshape(payload.shape)
+                .to(dtype)
+                .unsqueeze(0)
+            )
+
         return TensorMicroBatch(
             input_ids=torch.tensor(micro_batch.input_ids, dtype=torch.long).unsqueeze(0),
             position_ids=torch.tensor(micro_batch.position_ids, dtype=torch.long).unsqueeze(0),
@@ -254,6 +271,8 @@ class DataLoader:
             teacher_logprobs=torch.tensor(micro_batch.teacher_logprobs, dtype=torch.float).unsqueeze(0)
             if micro_batch.teacher_logprobs is not None
             else None,
+            teacher_topk_token_ids=_decode_encoded(micro_batch.teacher_topk_token_ids, torch.long),
+            teacher_topk_logprobs=_decode_encoded(micro_batch.teacher_topk_logprobs, torch.float),
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             env_names=micro_batch.env_names,

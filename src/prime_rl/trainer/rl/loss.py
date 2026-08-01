@@ -19,6 +19,9 @@ class LossInputs:
     teacher_logprobs: Float[Tensor, " seq"] | None
     advantages: Float[Tensor, " seq"]
     loss_mask: Bool[Tensor, " seq"]
+    teacher_topk_logprobs: Float[Tensor, "seq k"] | None = None
+    student_topk_logprobs: Float[Tensor, "seq k"] | None = None
+    sampled_token_in_teacher_topk: Bool[Tensor, " seq"] | None = None
 
 
 @dataclass
@@ -209,6 +212,58 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
     if teacher_logprobs is None:
         raise ValueError("opd_loss_fn requires teacher_logprobs - configure a teacher for opd mode.")
 
+    teacher_kl = teacher_logprobs - trainer_logprobs
+    has_teacher_topk = inputs.teacher_topk_logprobs is not None
+    has_student_topk = inputs.student_topk_logprobs is not None
+    if has_teacher_topk != has_student_topk:
+        raise ValueError("Teacher and student top-k logprobs must be provided together.")
+
+    if has_teacher_topk:
+        if inputs.sampled_token_in_teacher_topk is None:
+            raise ValueError("Top-k OPD requires sampled-token membership in the teacher top-k.")
+
+        # Teacher top-k union the realized student token. This follows the
+        # augmented-support reverse-KL formulation in Peter's OPD branch:
+        #   sum_{v in top-k(teacher) U {sample}} p_s(v) log(p_s(v) / p_t(v)).
+        # Both distributions retain their full-vocabulary normalization. The
+        # sampled term is added only when it is outside the teacher top-k, so
+        # a token already on the sparse support is never double counted.
+        student_logp = inputs.student_topk_logprobs
+        teacher_logp = inputs.teacher_topk_logprobs
+        student_p = torch.exp(student_logp)
+        teacher_p = torch.exp(teacher_logp)
+        sampled_in_topk = inputs.sampled_token_in_teacher_topk
+        sampled_outside_topk = ~sampled_in_topk
+        per_token_topk_rkl = (student_p * (student_logp - teacher_logp)).sum(dim=-1)
+        sampled_student_p = torch.exp(trainer_logprobs)
+        sampled_teacher_p = torch.exp(teacher_logprobs)
+        sampled_rkl_term = sampled_student_p * (trainer_logprobs - teacher_logprobs)
+        per_token_augmented_rkl = per_token_topk_rkl + torch.where(
+            sampled_outside_topk,
+            sampled_rkl_term,
+            torch.zeros_like(sampled_rkl_term),
+        )
+        augmented_student_mass = student_p.sum(dim=-1) + sampled_outside_topk * sampled_student_p
+        augmented_teacher_mass = teacher_p.sum(dim=-1) + sampled_outside_topk * sampled_teacher_p
+        loss = (loss_mask * per_token_augmented_rkl).sum()
+        metrics = {
+            "teacher_kl": _safe_mean(teacher_kl, loss_mask),
+            # Monte Carlo estimate of full-vocabulary KL(behavior || teacher)
+            # on tokens sampled from the inference/behavior policy. Using the
+            # trainer logprob here would be biased whenever the rollout is one
+            # policy version behind. Keep this token-level so the distributed
+            # metric collector forms the true global token mean.
+            "sampled_reverse_kl": (inference_logprobs - teacher_logprobs)[loss_mask],
+            "topk_reverse_kl": per_token_topk_rkl[loss_mask],
+            "topk_plus_sampled_reverse_kl": per_token_augmented_rkl[loss_mask],
+            "sampled_token_in_teacher_topk": sampled_in_topk[loss_mask].float(),
+            "topk_student_mass": student_p.sum(dim=-1)[loss_mask],
+            "topk_teacher_mass": teacher_p.sum(dim=-1)[loss_mask],
+            "topk_plus_sampled_student_mass": augmented_student_mass[loss_mask],
+            "topk_plus_sampled_teacher_mass": augmented_teacher_mass[loss_mask],
+        }
+        return LossOutputs(loss=loss, metrics=metrics)
+
     log_importance_ratio, importance_ratio, mismatch_kl = compute_importance_ratio_and_mismatch_kl(
         trainer_logprobs, inference_logprobs
     )
@@ -226,7 +281,6 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
     drop_mask = loss_mask & is_masked
     keep_mask = loss_mask & ~is_masked
 
-    teacher_kl = teacher_logprobs - trainer_logprobs
     advantages = 0.0 * advantages + 1.0 * teacher_kl.detach()
 
     pg_loss = keep_mask * advantages * importance_ratio
@@ -301,6 +355,10 @@ def compute_loss(
     loss_fns: dict[str, LossFn],
     loss_scale: int,
     training_mode: str = "rl",
+    teacher_topk_logprobs: list[Float[Tensor, "seq_i k"]] | None = None,
+    student_topk_logprobs: list[Float[Tensor, "seq_i k"]] | None = None,
+    sampled_token_in_teacher_topk: list[Bool[Tensor, " seq_i"]] | None = None,
+    sequence_balance: bool = False,
 ) -> tuple[Float[Tensor, ""], dict[str, Any]]:
     """
     Compute loss for packed sequences (batch size = 1, multiple sequences packed along sequence dimension).
@@ -318,6 +376,9 @@ def compute_loss(
         loss_fns: Per-mode loss fn dispatch table from setup_loss_fns()
         loss_scale: Scale factor to normalize the loss
         training_mode: Selects which loss fn to apply
+        sequence_balance: Normalize every nonempty sequence by its own number
+            of unmasked tokens before applying ``loss_scale``. The caller must
+            set ``loss_scale`` to the global number of nonempty sequences.
 
     Returns:
         Tuple of (scaled_loss, aggregated_metrics)
@@ -335,13 +396,22 @@ def compute_loss(
 
     if teacher_logprobs is None:
         teacher_logprobs = [None] * len(trainer_logprobs)
+    if teacher_topk_logprobs is None:
+        teacher_topk_logprobs = [None] * len(trainer_logprobs)
+    if student_topk_logprobs is None:
+        student_topk_logprobs = [None] * len(trainer_logprobs)
+    if sampled_token_in_teacher_topk is None:
+        sampled_token_in_teacher_topk = [None] * len(trainer_logprobs)
 
-    for t_logp, i_logp, teach_logp, adv, mask in zip(
+    for t_logp, i_logp, teach_logp, adv, mask, teacher_topk, student_topk, sampled_in_topk in zip(
         trainer_logprobs,
         inference_logprobs,
         teacher_logprobs,
         advantages,
         loss_mask,
+        teacher_topk_logprobs,
+        student_topk_logprobs,
+        sampled_token_in_teacher_topk,
     ):
         inputs = LossInputs(
             trainer_logprobs=t_logp,
@@ -349,11 +419,24 @@ def compute_loss(
             teacher_logprobs=teach_logp,
             advantages=adv,
             loss_mask=mask,
+            teacher_topk_logprobs=teacher_topk,
+            student_topk_logprobs=student_topk,
+            sampled_token_in_teacher_topk=sampled_in_topk,
         )
 
         result = effective_loss_fn(inputs)
 
-        total_loss = total_loss + result.loss
+        if sequence_balance:
+            # Top-k OPD is an average over sequences of per-sequence token
+            # means. Padding-only sequences contribute neither loss nor count.
+            sequence_token_count = mask.sum()
+            total_loss = total_loss + torch.where(
+                sequence_token_count > 0,
+                result.loss / sequence_token_count.clamp_min(1),
+                torch.zeros_like(result.loss),
+            )
+        else:
+            total_loss = total_loss + result.loss
 
         for k, v in result.metrics.items():
             if k not in all_metrics:

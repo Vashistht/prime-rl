@@ -4,6 +4,7 @@ import gc
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from itertools import cycle
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from verifiers.utils.save_utils import make_serializable
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.transport import TrainingSample
+from prime_rl.transport.types import EncodedTensor
 from prime_rl.utils.client import setup_inference_pool
 from prime_rl.utils.logger import InterceptHandler, get_logger
 from prime_rl.utils.utils import (
@@ -107,16 +109,33 @@ def trim_process_memory() -> None:
         get_logger().debug(f"malloc_trim(0) failed: {exc!r}")
 
 
+@dataclass
+class TeacherPrefillScores:
+    """Teacher scores aligned to the supplied input-token positions."""
+
+    logprobs: list[float]
+    topk_token_ids: EncodedTensor | None = None
+    topk_logprobs: EncodedTensor | None = None
+
+
 async def compute_teacher_logprobs(
     clients: list[vf.ClientConfig],
     model_name: str,
     samples: list[TrainingSample],
-) -> list[list[float]]:
-    """Compute teacher model logprobs for a batch of training samples via prefill."""
+    top_k: int | None = None,
+) -> list[TeacherPrefillScores]:
+    """Prefill-score samples under the teacher.
+
+    ``top_k`` requests the teacher's true top-k support at every position.
+    vLLM also returns the realized input token when it falls outside that
+    support. It is retained separately in ``logprobs`` so the trainer can
+    form the teacher-top-k union sampled-token objective without changing the
+    fixed-width sparse top-k tensors.
+    """
     import httpx
     from vllm.entrypoints.serve.disagg.protocol import GenerateResponse
 
-    async def _compute_single(client_config: vf.ClientConfig, sample: TrainingSample) -> list[float]:
+    async def _compute_single(client_config: vf.ClientConfig, sample: TrainingSample) -> TeacherPrefillScores:
         client = setup_openai_client(client_config)
 
         # Two escape hatches from ``AsyncOpenAI.post``:
@@ -141,7 +160,7 @@ async def compute_teacher_logprobs(
                     "max_tokens": 1,
                     "temperature": 1.0,
                     "top_p": 1.0,
-                    "prompt_logprobs": 1,
+                    "prompt_logprobs": top_k if top_k is not None else 1,
                 },
             },
         )
@@ -151,14 +170,60 @@ async def compute_teacher_logprobs(
         # no preceding context. Flatten to ``list[float]`` with 0.0 in the
         # unscored slot.
         flat: list[float] = []
-        for entry in response.prompt_logprobs or []:
+        topk_ids: list[list[int]] = []
+        topk_logprobs: list[list[float]] = []
+
+        def _logprob(value) -> float | None:
+            return value.logprob if hasattr(value, "logprob") else value.get("logprob")
+
+        def _sortable_logprob(value) -> float:
+            logprob = _logprob(value)
+            return float(logprob) if logprob is not None else float("-inf")
+
+        input_ids = sample.prompt_ids + sample.completion_ids
+        for position, entry in enumerate(response.prompt_logprobs or []):
             if not entry:
                 flat.append(0.0)
+                if top_k is not None:
+                    topk_ids.append([0] * top_k)
+                    topk_logprobs.append([-1e9] * top_k)
                 continue
-            first = next(iter(entry.values()))
-            lp = first.logprob if hasattr(first, "logprob") else first.get("logprob")
+            realized_token_id = input_ids[position]
+            realized = entry.get(realized_token_id)
+            if realized is None:
+                realized = entry.get(str(realized_token_id))
+            if realized is None:
+                raise ValueError(
+                    f"Teacher prompt-logprob row {position} does not contain realized token {realized_token_id}."
+                )
+            lp = _logprob(realized)
             flat.append(float(lp) if lp is not None else 0.0)
-        return flat
+            if top_k is not None:
+                ranked = sorted(entry.items(), key=lambda item: _sortable_logprob(item[1]), reverse=True)[:top_k]
+                if len(ranked) != top_k:
+                    raise ValueError(
+                        f"Teacher returned only {len(ranked)} logprobs for a requested top-k of {top_k}. "
+                        "Set the teacher inference server's max_logprobs to at least opd_top_k."
+                    )
+                ids = [int(token_id) for token_id, _ in ranked]
+                lps = [_sortable_logprob(value) for _, value in ranked]
+                topk_ids.append(ids)
+                topk_logprobs.append(lps)
+
+        expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
+        if len(flat) != expected_len:
+            raise ValueError(f"Teacher returned {len(flat)} score rows for {expected_len} input tokens.")
+
+        if top_k is None:
+            return TeacherPrefillScores(logprobs=flat)
+
+        import numpy as np
+
+        return TeacherPrefillScores(
+            logprobs=flat,
+            topk_token_ids=EncodedTensor.from_numpy(np.asarray(topk_ids, dtype=np.int32)),
+            topk_logprobs=EncodedTensor.from_numpy(np.asarray(topk_logprobs, dtype=np.float32)),
+        )
 
     return await asyncio.gather(*[_compute_single(client, sample) for client, sample in zip(cycle(clients), samples)])
 

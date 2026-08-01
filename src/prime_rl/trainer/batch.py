@@ -2,14 +2,35 @@ import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+import numpy as np
+
 from prime_rl.trainer.utils import balanced_partition
-from prime_rl.transport.types import MicroBatch, RoutedExperts, TrainingSample
+from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TrainingSample
 
 ROUTED_EXPERTS_DTYPE_ITEMSIZE = {
     "uint8": 1,
     "int16": 2,
     "int32": 4,
 }
+
+
+def _copy_encoded_tensor(tensor: EncodedTensor) -> EncodedTensor:
+    return EncodedTensor(dtype=tensor.dtype, shape=list(tensor.shape), data=tensor.data)
+
+
+def _slice_encoded_tensor(tensor: EncodedTensor, num_rows: int) -> EncodedTensor:
+    row_size = int(np.prod(tensor.shape[1:], dtype=np.int64)) * np.dtype(tensor.dtype).itemsize
+    return EncodedTensor(
+        dtype=tensor.dtype,
+        shape=[num_rows, *tensor.shape[1:]],
+        data=tensor.data[: num_rows * row_size],
+    )
+
+
+def _topk_pad_rows(num_rows: int, k: int) -> tuple[bytes, bytes]:
+    ids = np.zeros((num_rows, k), dtype=np.int32)
+    logprobs = np.full((num_rows, k), -1e9, dtype=np.float32)
+    return ids.tobytes(), logprobs.tobytes()
 
 
 def _copy_routed_experts(routed_experts: RoutedExperts) -> RoutedExperts:
@@ -65,6 +86,19 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     # Teacher logprobs already cover the full sequence (prompt + completion),
     # computed via prefill in the orchestrator when a teacher model is configured
     teacher_logprobs = training_example.teacher_logprobs
+    teacher_topk_token_ids = (
+        _copy_encoded_tensor(training_example.teacher_topk_token_ids)
+        if training_example.teacher_topk_token_ids is not None
+        else None
+    )
+    teacher_topk_logprobs = (
+        _copy_encoded_tensor(training_example.teacher_topk_logprobs)
+        if training_example.teacher_topk_logprobs is not None
+        else None
+    )
+    assert (teacher_topk_token_ids is None) == (teacher_topk_logprobs is None), (
+        "teacher_topk_token_ids and teacher_topk_logprobs must be present together"
+    )
     routed_experts = (
         _copy_routed_experts(training_example.routed_experts) if training_example.routed_experts is not None else None
     )
@@ -79,6 +113,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
+        if teacher_topk_token_ids is not None:
+            teacher_topk_token_ids = _slice_encoded_tensor(teacher_topk_token_ids, seq_len)
+            teacher_topk_logprobs = _slice_encoded_tensor(teacher_topk_logprobs, seq_len)
         if routed_experts is not None:
             routed_experts = _slice_routed_experts(routed_experts, seq_len)
         if mm_token_type_ids is not None:
@@ -98,6 +135,11 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     )
     if teacher_logprobs is not None:
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
+    if teacher_topk_token_ids is not None:
+        assert teacher_topk_token_ids.shape[0] == len(input_ids)
+        assert teacher_topk_token_ids.shape == teacher_topk_logprobs.shape
+        assert teacher_topk_token_ids.dtype == "int32"
+        assert teacher_topk_logprobs.dtype == "float32"
 
     if routed_experts is not None:
         assert routed_experts.shape[0] == len(input_ids), (
@@ -126,6 +168,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         env_names=env_names,
         mm_kwargs=training_example.mm_kwargs,
         training_mode=training_example.training_mode,
+        teacher_topk_token_ids=teacher_topk_token_ids,
+        teacher_topk_logprobs=teacher_topk_logprobs,
     )
 
 
@@ -155,6 +199,11 @@ class _MicroBatchBin:
             and self.length + len(sample.input_ids) <= max_seq_len
             and first_sample.training_mode == sample.training_mode
             and (first_sample.routed_experts is None) == (sample.routed_experts is None)
+            and (first_sample.teacher_topk_token_ids is None) == (sample.teacher_topk_token_ids is None)
+            and (
+                first_sample.teacher_topk_token_ids is None
+                or first_sample.teacher_topk_token_ids.shape[1] == sample.teacher_topk_token_ids.shape[1]
+            )
         )
 
     def add(self, lora_idx: int, sample: MicroBatch) -> None:
@@ -187,6 +236,14 @@ class _MicroBatchBin:
 def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     has_rewards = any(sample.rewards is not None for _, sample in bin_content.samples)
     has_teacher_logprobs = any(sample.teacher_logprobs is not None for _, sample in bin_content.samples)
+    topk_k = next(
+        (
+            sample.teacher_topk_token_ids.shape[1]
+            for _, sample in bin_content.samples
+            if sample.teacher_topk_token_ids is not None
+        ),
+        None,
+    )
     has_mm_token_type_ids = any(sample.mm_token_type_ids is not None for _, sample in bin_content.samples)
 
     input_ids: list[int] = []
@@ -198,6 +255,8 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     env_names: list[str] = []
     rewards: list[float] | None = [] if has_rewards else None
     teacher_logprobs: list[float] | None = [] if has_teacher_logprobs else None
+    teacher_topk_ids_parts: list[bytes] = []
+    teacher_topk_logprobs_parts: list[bytes] = []
     mm_token_type_ids: list[int] | None = [] if has_mm_token_type_ids else None
     routed_experts: RoutedExperts | None = None
     lora_num_tokens = [0] * num_loras
@@ -217,6 +276,16 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
             teacher_logprobs.extend(
                 sample.teacher_logprobs if sample.teacher_logprobs is not None else [0.0] * sample_len
             )
+        if topk_k is not None:
+            if sample.teacher_topk_token_ids is None:
+                pad_ids, pad_logprobs = _topk_pad_rows(sample_len, topk_k)
+                teacher_topk_ids_parts.append(pad_ids)
+                teacher_topk_logprobs_parts.append(pad_logprobs)
+            else:
+                if sample.teacher_topk_token_ids.shape[1] != topk_k:
+                    raise ValueError("Cannot pack teacher top-k streams with different k values.")
+                teacher_topk_ids_parts.append(sample.teacher_topk_token_ids.data)
+                teacher_topk_logprobs_parts.append(sample.teacher_topk_logprobs.data)
         if mm_token_type_ids is not None:
             mm_token_type_ids.extend(
                 sample.mm_token_type_ids if sample.mm_token_type_ids is not None else [0] * sample_len
@@ -251,6 +320,20 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         env_names=env_names,
         mm_kwargs=first_sample.mm_kwargs if _is_multimodal_sample(first_sample) else None,
         training_mode=first_sample.training_mode,
+        teacher_topk_token_ids=EncodedTensor(
+            dtype="int32",
+            shape=[len(input_ids), topk_k],
+            data=b"".join(teacher_topk_ids_parts),
+        )
+        if topk_k is not None
+        else None,
+        teacher_topk_logprobs=EncodedTensor(
+            dtype="float32",
+            shape=[len(input_ids), topk_k],
+            data=b"".join(teacher_topk_logprobs_parts),
+        )
+        if topk_k is not None
+        else None,
     )
 
 
@@ -359,6 +442,13 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.temperatures.extend([1.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
+    if micro_batch.teacher_topk_token_ids is not None:
+        k = micro_batch.teacher_topk_token_ids.shape[1]
+        pad_ids, pad_logprobs = _topk_pad_rows(padding_size, k)
+        micro_batch.teacher_topk_token_ids.data += pad_ids
+        micro_batch.teacher_topk_token_ids.shape[0] += padding_size
+        micro_batch.teacher_topk_logprobs.data += pad_logprobs
+        micro_batch.teacher_topk_logprobs.shape[0] += padding_size
     if micro_batch.lora_num_tokens is not None:
         micro_batch.lora_num_tokens[-1] += (
             padding_size  # We send padding to the last lora so that tokens have ascending lora idx

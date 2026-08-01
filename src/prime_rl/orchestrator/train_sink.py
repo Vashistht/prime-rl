@@ -122,9 +122,57 @@ class TrainSink:
             counts[r.env_name] += 1
         return dict(counts)
 
-    async def add(self, rollout: TrainRollout) -> TrainBatch | None:
+    def _drop_stale_buffered_rollouts(self, min_policy_version: int) -> int:
+        """Drop buffered rollouts that are too old for the next train step.
+
+        Completed rollouts stop aging once they leave the dispatcher, so this
+        sink-side check is the authoritative training-time freshness guard.
+        Partial groups are dropped as a unit because their rewards/advantages
+        may depend on the complete group.
+        """
+        stale_batch = [r for r in self.pending_batch if r.policy_version < min_policy_version]
+        if stale_batch:
+            self.pending_batch = [r for r in self.pending_batch if r.policy_version >= min_policy_version]
+
+        stale_group_ids = [
+            group_id
+            for group_id, group in self.pending_groups.items()
+            if group and any(r.policy_version < min_policy_version for r in group)
+        ]
+        stale_group_rollouts = 0
+        for group_id in stale_group_ids:
+            stale_group_rollouts += len(self.pending_groups.pop(group_id))
+
+        dropped = len(stale_batch) + stale_group_rollouts
+        if dropped:
+            get_logger().debug(f"Dropped {dropped} buffered train rollout(s) older than policy v{min_policy_version}")
+        return dropped
+
+    def _batch_is_ready(self) -> bool:
+        if self.batch_size is not None:
+            return len(self.pending_batch) >= self.batch_size
+        return sum(
+            r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
+            for r in self.pending_batch
+        ) >= (self.token_batch_size or 0)
+
+    async def add(self, rollout: TrainRollout, *, min_policy_version: int = 0) -> TrainBatch | None:
         """Process one arrival; finalize the group on the ``group_size``-th
-        arrival; return a ``TrainBatch`` if the batch threshold is met."""
+        arrival; return a ``TrainBatch`` if the batch threshold is met.
+
+        Rollouts older than ``min_policy_version`` are rejected, including
+        rollouts buffered before the train step advanced. The batch is only
+        extracted after this purge, so stale drops are refilled rather than
+        shrinking the trainer-bound cohort.
+        """
+        self._drop_stale_buffered_rollouts(min_policy_version)
+        if rollout.policy_version < min_policy_version:
+            get_logger().debug(
+                f"Dropped train rollout from policy v{rollout.policy_version}; "
+                f"next train batch requires policy v{min_policy_version} or newer"
+            )
+            return self.process_batch() if self._batch_is_ready() else None
+
         await self.process_rollout(rollout)
         env_name = rollout.env_name
         self.arrivals_by_env[env_name] += 1
@@ -133,16 +181,7 @@ class TrainSink:
         self.pending_groups[rollout.group_id].append(rollout)
         if len(self.pending_groups[rollout.group_id]) >= self.group_size_for(env_name):
             self.process_group(rollout.group_id)
-        ready = (
-            len(self.pending_batch) >= self.batch_size
-            if self.batch_size is not None
-            else sum(
-                r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
-                for r in self.pending_batch
-            )
-            >= (self.token_batch_size or 0)
-        )
-        if ready:
+        if self._batch_is_ready():
             return self.process_batch()
         return None
 

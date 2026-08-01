@@ -6,7 +6,15 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from prime_rl.trainer.models import cast_float_and_contiguous
 from prime_rl.trainer.models.layers.lm_head import FusedOutputLinear, VanillaOutputLinear, inject_prime_lm_head
 from prime_rl.trainer.models.llama import LlamaForCausalLM as PrimeRLLlamaForCausalLM
-from prime_rl.trainer.rl.loss import compute_entropy, selective_log_softmax, shift_tensor_left, shift_tensor_right
+from prime_rl.trainer.rl.loss import (
+    LossInputs,
+    compute_entropy,
+    compute_loss,
+    opd_loss_fn,
+    selective_log_softmax,
+    shift_tensor_left,
+    shift_tensor_right,
+)
 from prime_rl.utils.utils import default_dtype
 
 
@@ -59,6 +67,154 @@ def test_fused_lm_head_matches_full_logits_forward_and_backward_cpu():
     torch.testing.assert_close(out["entropy"], ent0, rtol=0, atol=1e-5)
     torch.testing.assert_close(grad_hidden1, grad_hidden0, rtol=0, atol=1e-5)
     torch.testing.assert_close(grad_weight1, grad_weight0, rtol=0, atol=1e-5)
+
+
+def test_fused_teacher_topk_plus_sample_matches_dense_forward_and_backward_cpu():
+    """Sparse fused gathers preserve the augmented-support reverse-KL gradient."""
+    torch.manual_seed(17)
+    batch, seq, hidden_size, vocab_size, k = 1, 4, 7, 19, 5
+    temperature = torch.ones((batch, seq), dtype=torch.float32)
+
+    teacher_logits = torch.randn(batch, seq, vocab_size)
+    teacher_logprobs = torch.log_softmax(teacher_logits, dim=-1)
+    teacher_topk_ids = teacher_logits.topk(k, dim=-1).indices
+    teacher_topk_logprobs = teacher_logprobs.gather(-1, teacher_topk_ids)
+
+    # Make the realized token at position zero explicitly outside teacher top-k.
+    outside = next(token for token in range(vocab_size) if token not in teacher_topk_ids[0, 0].tolist())
+    labels = torch.randint(0, vocab_size, (batch, seq))
+    labels[0, 0] = outside
+    assert not (teacher_topk_ids[0, 0] == labels[0, 0]).any()
+
+    hidden_dense = torch.randn(batch, seq, hidden_size, requires_grad=True)
+    weight_dense = torch.randn(vocab_size, hidden_size, requires_grad=True)
+    dense_logprobs = torch.log_softmax(hidden_dense @ weight_dense.t(), dim=-1)
+    dense_student_topk = dense_logprobs.gather(-1, teacher_topk_ids)
+    student_p = dense_student_topk.exp()
+    sampled_in_topk = (teacher_topk_ids == labels.unsqueeze(-1)).any(dim=-1)
+    student_sampled_logprobs = dense_logprobs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    teacher_sampled_logprobs = teacher_logprobs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    dense_topk_loss = (student_p * (dense_student_topk - teacher_topk_logprobs)).sum(dim=-1)
+    dense_sample_loss = student_sampled_logprobs.exp() * (student_sampled_logprobs - teacher_sampled_logprobs)
+    dense_loss = (dense_topk_loss + (~sampled_in_topk) * dense_sample_loss).sum()
+    dense_loss.backward()
+
+    hidden_fused = hidden_dense.detach().clone().requires_grad_(True)
+    fused = FusedOutputLinear(hidden_size, vocab_size, chunk_size=3)
+    fused.weight = torch.nn.Parameter(weight_dense.detach().clone())
+    output = fused(
+        hidden_fused,
+        labels=labels,
+        temperature=temperature,
+        extra_gather_ids=teacher_topk_ids,
+    )
+    result = opd_loss_fn(
+        LossInputs(
+            trainer_logprobs=output["logprobs"].reshape(-1),
+            inference_logprobs=output["logprobs"].detach().reshape(-1),
+            teacher_logprobs=teacher_sampled_logprobs.reshape(-1),
+            advantages=torch.zeros(seq),
+            loss_mask=torch.ones(seq, dtype=torch.bool),
+            teacher_topk_logprobs=teacher_topk_logprobs.reshape(seq, k),
+            student_topk_logprobs=output["topk_logprobs"].reshape(seq, k),
+            sampled_token_in_teacher_topk=sampled_in_topk.reshape(-1),
+        )
+    )
+    result.loss.backward()
+
+    torch.testing.assert_close(output["topk_logprobs"], dense_student_topk, rtol=0, atol=1e-5)
+    torch.testing.assert_close(result.loss, dense_loss.detach(), rtol=0, atol=1e-5)
+    torch.testing.assert_close(hidden_fused.grad, hidden_dense.grad, rtol=0, atol=1e-5)
+    torch.testing.assert_close(fused.weight.grad, weight_dense.grad, rtol=0, atol=1e-5)
+
+
+def test_fused_teacher_topk_alignment_for_packed_sequences_and_padding_cpu():
+    """Production shifts keep teacher rows aligned across packed boundaries and padding."""
+    torch.manual_seed(23)
+    batch, seq, hidden_size, vocab_size, k = 1, 9, 7, 23, 4
+    sequence_lengths = [3, 4, 2]
+    loss_mask = torch.tensor([[False, True, True, False, True, True, True, False, False]])
+    temperature = torch.ones((batch, seq), dtype=torch.float32)
+    uniform_logprob = torch.log(torch.tensor(1.0 / vocab_size)).item()
+
+    input_ids = torch.randint(0, vocab_size, (batch, seq))
+    teacher_logits = torch.randn(batch, seq, vocab_size)
+    teacher_logprobs = torch.log_softmax(teacher_logits, dim=-1)
+    teacher_topk_ids = teacher_logits.topk(k, dim=-1).indices
+    teacher_topk_logprobs = teacher_logprobs.gather(-1, teacher_topk_ids)
+
+    hidden_dense = torch.randn(batch, seq, hidden_size, requires_grad=True)
+    weight_dense = torch.randn(vocab_size, hidden_size, requires_grad=True)
+    dense_logprobs = torch.log_softmax(hidden_dense @ weight_dense.t(), dim=-1)
+    dense_student_topk = torch.cat(
+        [
+            torch.full((batch, 1, k), uniform_logprob),
+            dense_logprobs[:, :-1].gather(-1, teacher_topk_ids[:, 1:]),
+        ],
+        dim=1,
+    )
+    student_p = dense_student_topk.exp()
+    sampled_in_topk = (teacher_topk_ids == input_ids.unsqueeze(-1)).any(dim=-1)
+    teacher_sampled_logprobs = teacher_logprobs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
+    dense_sampled_logprobs = torch.cat(
+        [
+            torch.full((batch, 1), uniform_logprob),
+            dense_logprobs[:, :-1].gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1),
+        ],
+        dim=1,
+    )
+    per_token_topk_loss = (student_p * (dense_student_topk - teacher_topk_logprobs)).sum(dim=-1)
+    per_token_sample_loss = dense_sampled_logprobs.exp() * (dense_sampled_logprobs - teacher_sampled_logprobs)
+    per_token_loss = per_token_topk_loss + (~sampled_in_topk) * per_token_sample_loss
+    dense_loss = (per_token_loss[0, 1:3].mean() + per_token_loss[0, 4:7].mean()) / 2
+    dense_loss.backward()
+
+    hidden_fused = hidden_dense.detach().clone().requires_grad_(True)
+    fused = FusedOutputLinear(hidden_size, vocab_size, chunk_size=3)
+    fused.weight = torch.nn.Parameter(weight_dense.detach().clone())
+
+    # These are the two shifts used around the production model forward. Row i
+    # contains the teacher distribution that produced input token i.
+    labels = shift_tensor_left(input_ids)
+    extra_gather_ids = torch.cat(
+        [teacher_topk_ids[:, 1:], torch.zeros_like(teacher_topk_ids[:, :1])],
+        dim=1,
+    )
+    output = fused(
+        hidden_fused,
+        labels=labels,
+        temperature=temperature,
+        extra_gather_ids=extra_gather_ids,
+    )
+    student_topk_logprobs = torch.cat(
+        [
+            torch.full_like(output["topk_logprobs"][:, :1], uniform_logprob),
+            output["topk_logprobs"][:, :-1],
+        ],
+        dim=1,
+    )
+    trainer_logprobs = shift_tensor_right(output["logprobs"], pad_value=uniform_logprob)
+
+    fused_loss, _ = compute_loss(
+        trainer_logprobs=list(trainer_logprobs.squeeze(0).split(sequence_lengths)),
+        inference_logprobs=list(trainer_logprobs.detach().squeeze(0).split(sequence_lengths)),
+        teacher_logprobs=list(teacher_sampled_logprobs.squeeze(0).split(sequence_lengths)),
+        advantages=[torch.zeros(length) for length in sequence_lengths],
+        loss_mask=list(loss_mask.squeeze(0).split(sequence_lengths)),
+        loss_fns={"opd": opd_loss_fn},
+        loss_scale=2,
+        training_mode="opd",
+        teacher_topk_logprobs=list(teacher_topk_logprobs.squeeze(0).split(sequence_lengths)),
+        student_topk_logprobs=list(student_topk_logprobs.squeeze(0).split(sequence_lengths)),
+        sampled_token_in_teacher_topk=list(sampled_in_topk.squeeze(0).split(sequence_lengths)),
+        sequence_balance=True,
+    )
+    fused_loss.backward()
+
+    torch.testing.assert_close(student_topk_logprobs, dense_student_topk, rtol=0, atol=1e-5)
+    torch.testing.assert_close(fused_loss, dense_loss.detach(), rtol=0, atol=1e-5)
+    torch.testing.assert_close(hidden_fused.grad, hidden_dense.grad, rtol=0, atol=1e-5)
+    torch.testing.assert_close(fused.weight.grad, weight_dense.grad, rtol=0, atol=1e-5)
 
 
 def test_fused_lm_head_requires_labels():

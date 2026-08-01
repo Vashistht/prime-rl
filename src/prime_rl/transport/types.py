@@ -13,6 +13,14 @@ class EncodedTensor(msgspec.Struct, array_like=True, gc=False):
     shape: list[int]
     data: bytes
 
+    @classmethod
+    def from_numpy(cls, array) -> "EncodedTensor":
+        """Encode a contiguous NumPy array without expanding it into lists."""
+        import numpy as np
+
+        array = np.ascontiguousarray(array)
+        return cls(dtype=str(array.dtype), shape=list(array.shape), data=array.tobytes())
+
 
 # Routed experts are large per-token arrays. tolist() is too expensive, so we
 # send raw bytes through msgpack and carry the shape/dtype needed to rebuild.
@@ -56,6 +64,13 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # taus), sft uses sft_loss_fn. Stamped by the orchestrator from training_mode.
     training_mode: TrainingMode = "rl"
 
+    # Sparse teacher top-k distribution for OPD, aligned to input-token
+    # positions: [sequence, k] int32 IDs and full-vocabulary-normalized
+    # float32 log-probabilities. The trainer unions this support with the
+    # realized student token. Appended for array-like wire compatibility.
+    teacher_topk_token_ids: EncodedTensor | None = None
+    teacher_topk_logprobs: EncodedTensor | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -94,3 +109,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # Packer-derived metadata used for run-local token exports.
     run_id: str | None = None
     run_step: int | None = None
+
+    # Packed sparse teacher distributions; see TrainingSample above.
+    teacher_topk_token_ids: EncodedTensor | None = None
+    teacher_topk_logprobs: EncodedTensor | None = None

@@ -213,7 +213,10 @@ class RolloutDispatcher:
         """True once nothing is in flight, no eval queued, and ``out_q`` is
         empty — the pipeline has fully drained."""
         eval_drained = self.eval_source is None or not self.eval_source
-        return not self.inflight and eval_drained and self.out_q.empty()
+        # A source item is moved into ``groups`` before client selection. The
+        # selection may yield while no task is in ``inflight`` yet, so groups
+        # must participate in the drain condition too.
+        return not self.inflight and not self.groups and eval_drained and self.out_q.empty()
 
     def disable_train_scheduling(self) -> None:
         """Stop scheduling new train rollouts; in-flight train + any
@@ -670,7 +673,10 @@ class RolloutDispatcher:
         orchestrator at ``max_steps`` so triggered eval can still complete
         through the pipeline while wasted train inference is short-circuited."""
         train_tasks: list[asyncio.Task] = []
-        train_group_ids: set[uuid.UUID] = set()
+        # Include groups still awaiting client selection; they do not have an
+        # entry in ``inflight`` yet. ``schedule_group_rollout`` rechecks group
+        # membership after that await and will then decline to launch them.
+        train_group_ids = {gid for gid, group in self.groups.items() if group.kind == "train"}
         cancelled = 0
         for task, meta in list(self.inflight.items()):
             if meta.kind != "train":

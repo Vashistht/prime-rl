@@ -361,6 +361,23 @@ def train(config: TrainerConfig):
         dist.all_reduce(global_loss_scale, op=dist.ReduceOp.SUM, group=dp_cp_group)
         loss_scale = max(global_loss_scale.item(), 1)
 
+        # MOPD top-k uses a sequence-balanced objective: each completion is a
+        # per-token mean, followed by a mean over examples. Count only real
+        # (non-padding) top-k sequences here. This count is duplicated across
+        # CP ranks just like the loss numerator, so the duplication cancels
+        # after the FSDP gradient average is undone below.
+        local_topk_sequence_count = sum(
+            sum(
+                int(sequence_mask.any().item())
+                for sequence_mask in micro_batch["loss_mask"].flatten().split(micro_batch["sequence_lengths"])
+            )
+            for micro_batch in micro_batches
+            if micro_batch["training_mode"] == "opd" and micro_batch["teacher_topk_logprobs"] is not None
+        )
+        global_topk_sequence_count = torch.tensor(local_topk_sequence_count, dtype=torch.int64, device="cuda")
+        dist.all_reduce(global_topk_sequence_count, op=dist.ReduceOp.SUM, group=dp_cp_group)
+        topk_sequence_loss_scale = max(global_topk_sequence_count.item(), 1)
+
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
         cp_enabled = parallel_dims.cp_enabled
@@ -376,6 +393,21 @@ def train(config: TrainerConfig):
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             teacher_logprobs = (
                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
+            )
+            teacher_topk_token_ids = (
+                micro_batch["teacher_topk_token_ids"].to("cuda")
+                if micro_batch["teacher_topk_token_ids"] is not None
+                else None
+            )
+            teacher_topk_logprobs = (
+                micro_batch["teacher_topk_logprobs"].to("cuda")
+                if micro_batch["teacher_topk_logprobs"] is not None
+                else None
+            )
+            sampled_token_in_teacher_topk = (
+                (teacher_topk_token_ids == input_ids.unsqueeze(-1)).any(dim=-1)
+                if teacher_topk_token_ids is not None
+                else None
             )
             routed_experts = (
                 micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
@@ -403,6 +435,17 @@ def train(config: TrainerConfig):
             )
 
             labels = shift_tensor_left(input_ids)
+            extra_gather_ids = None
+            if teacher_topk_token_ids is not None:
+                # Teacher row i is the distribution that produced input token
+                # i; model position j predicts input token j+1.
+                extra_gather_ids = torch.cat(
+                    [
+                        teacher_topk_token_ids[:, 1:],
+                        torch.zeros_like(teacher_topk_token_ids[:, :1]),
+                    ],
+                    dim=1,
+                )
 
             # VLM + CP is not supported: MRoPE requires global positions but CP shards the sequence
             if cp_enabled and mm_kwargs is not None:
@@ -415,6 +458,12 @@ def train(config: TrainerConfig):
                 labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
                 if routed_experts is not None:
                     routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
+                if extra_gather_ids is not None:
+                    extra_gather_ids = shard_for_cp(
+                        extra_gather_ids,
+                        cp_rank=cp_rank,
+                        cp_world_size=cp_size,
+                    )
             else:
                 forward_position_ids = position_ids
 
@@ -447,6 +496,7 @@ def train(config: TrainerConfig):
                     mm_kwargs=mm_kwargs,
                     mm_token_type_ids=mm_token_type_ids,
                     routed_experts=routed_experts,
+                    extra_gather_ids=extra_gather_ids,
                 )
 
             if out.get("logprobs") is None:
@@ -457,11 +507,19 @@ def train(config: TrainerConfig):
                 scaled_logits = logits / temperatures.unsqueeze(-1)
                 out["logprobs"] = selective_log_softmax(scaled_logits, labels)
                 out["entropy"] = compute_entropy(scaled_logits)
+                if extra_gather_ids is not None:
+                    out["topk_logprobs"] = torch.gather(
+                        torch.log_softmax(scaled_logits, dim=-1),
+                        dim=-1,
+                        index=extra_gather_ids,
+                    )
             # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
 
             if cp_enabled:
                 out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
                 out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
+                if out.get("topk_logprobs") is not None:
+                    out["topk_logprobs"] = gather_for_cp(out["topk_logprobs"], cp_group)
 
             vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
             # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
@@ -472,8 +530,22 @@ def train(config: TrainerConfig):
                 out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
             )
 
+            student_topk_logprobs = out.get("topk_logprobs")
+            if extra_gather_ids is not None:
+                if student_topk_logprobs is None:
+                    raise ValueError("The configured LM head did not return sparse student logprobs for OPD top-k.")
+                uniform_logprob = torch.log(torch.tensor(1.0 / vocab_size)).item()
+                student_topk_logprobs = torch.cat(
+                    [
+                        torch.full_like(student_topk_logprobs[:, :1], uniform_logprob),
+                        student_topk_logprobs[:, :-1],
+                    ],
+                    dim=1,
+                )
+
             # Compute loss
             sequence_lengths = micro_batch["sequence_lengths"]
+            sequence_balance = micro_batch["training_mode"] == "opd" and teacher_topk_logprobs is not None
             loss, loss_tensors = compute_loss(
                 trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
                 inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
@@ -483,8 +555,18 @@ def train(config: TrainerConfig):
                 advantages=advantages.squeeze().split(sequence_lengths),
                 loss_mask=loss_mask.squeeze().split(sequence_lengths),
                 loss_fns=loss_fns,
-                loss_scale=loss_scale,
+                loss_scale=topk_sequence_loss_scale if sequence_balance else loss_scale,
                 training_mode=micro_batch["training_mode"],
+                teacher_topk_logprobs=teacher_topk_logprobs.squeeze(0).split(sequence_lengths)
+                if teacher_topk_logprobs is not None
+                else None,
+                student_topk_logprobs=student_topk_logprobs.squeeze(0).split(sequence_lengths)
+                if student_topk_logprobs is not None
+                else None,
+                sampled_token_in_teacher_topk=sampled_token_in_teacher_topk.squeeze(0).split(sequence_lengths)
+                if sampled_token_in_teacher_topk is not None
+                else None,
+                sequence_balance=sequence_balance,
             )
 
             # Backward pass
@@ -551,8 +633,9 @@ def train(config: TrainerConfig):
             }
             token_exporter.mark_stable(ready_run_ids)
 
-        # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
-        # across dp_cp so the final gradient is the true per-token mean over the global batch.
+        # compute_loss already divided by the global normalization count (tokens
+        # normally, nonempty sequences for top-k OPD). Undo FSDP's per-rank
+        # averaging across dp_cp to recover the corresponding global mean.
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)

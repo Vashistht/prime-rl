@@ -20,6 +20,7 @@ class PrimeLmOutput(TypedDict, total=False):
     logprobs: Tensor | None
     entropy: Tensor | None
     loss: Tensor | None
+    topk_logprobs: Tensor | None
 
 
 def cast_float_and_contiguous(output: PrimeLmOutput) -> PrimeLmOutput:
@@ -33,6 +34,7 @@ def cast_float_and_contiguous(output: PrimeLmOutput) -> PrimeLmOutput:
         logprobs=_float_and_contiguous(output.get("logprobs")),
         entropy=_float_and_contiguous(output.get("entropy")),
         loss=output.get("loss"),
+        topk_logprobs=_float_and_contiguous(output.get("topk_logprobs")),
     )
 
 
@@ -46,6 +48,7 @@ class FusedOutputLinear(torch.nn.Linear):
         hidden_states: torch.Tensor,
         labels: torch.Tensor | None = None,
         temperature: Tensor | None = None,
+        extra_gather_ids: Tensor | None = None,
     ) -> PrimeLmOutput:
         assert labels is not None, "FusedOutputLinear requires labels for chunked logprob computation"
         assert temperature is not None, "FusedOutputLinear requires per-token temperatures"
@@ -55,13 +58,26 @@ class FusedOutputLinear(torch.nn.Linear):
         labels = labels.reshape(b * s).contiguous()
         inv_t = 1.0 / temperature.reshape(b * s).contiguous()  # [N]
 
-        logprobs, entropy = _SequenceChunkedLogProbEntropyFn.apply(
-            hidden_states, self.weight, labels, inv_t, self.chunk_size
-        )
+        if extra_gather_ids is None:
+            logprobs, entropy = _SequenceChunkedLogProbEntropyFn.apply(
+                hidden_states, self.weight, labels, inv_t, self.chunk_size
+            )
+            return PrimeLmOutput(logprobs=logprobs.reshape(b, s), entropy=entropy.reshape(b, s))
 
-        logprobs = logprobs.reshape(b, s)
-        entropy = entropy.reshape(b, s)
-        return PrimeLmOutput(logprobs=logprobs, entropy=entropy)
+        gather_ids = extra_gather_ids.reshape(b * s, -1).long().contiguous()
+        combined, entropy = _SequenceChunkedLogProbEntropyTopKFn.apply(
+            hidden_states,
+            self.weight,
+            labels,
+            inv_t,
+            self.chunk_size,
+            gather_ids,
+        )
+        return PrimeLmOutput(
+            logprobs=combined[:, 0].reshape(b, s),
+            entropy=entropy.reshape(b, s),
+            topk_logprobs=combined[:, 1:].reshape(b, s, -1),
+        )
 
 
 class VanillaOutputLinear(torch.nn.Linear):
@@ -69,7 +85,11 @@ class VanillaOutputLinear(torch.nn.Linear):
         super().__init__(in_features, out_features, bias=False)
 
     def forward(
-        self, hidden_states: torch.Tensor, labels: torch.Tensor | None = None, temperature: Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        temperature: Tensor | None = None,
+        extra_gather_ids: Tensor | None = None,
     ) -> PrimeLmOutput:
         # VanillaOutputLinear just returns logits - temperature scaling is done externally in train.py
         return PrimeLmOutput(logits=super().forward(hidden_states))
@@ -269,6 +289,156 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         return grad_hidden, grad_weight, None, None, None
 
 
+class _SequenceChunkedLogProbEntropyTopKFn(torch.autograd.Function):
+    """Chunked full-vocabulary log-softmax with sparse differentiable gathers."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        labels: torch.Tensor,
+        inv_temperature: torch.Tensor,
+        chunk_size: int,
+        extra_gather_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert hidden.dim() == 2
+        assert weight.dim() == 2
+        assert labels.dim() == 1
+        assert inv_temperature.dim() == 1
+        assert extra_gather_ids.dim() == 2
+        assert hidden.shape[0] == labels.shape[0] == inv_temperature.shape[0] == extra_gather_ids.shape[0]
+        assert hidden.shape[1] == weight.shape[1]
+        assert chunk_size > 0
+
+        device = hidden.device
+        num_tokens = hidden.shape[0]
+        vocab_size = weight.shape[0]
+        vocab_chunk_size = min(vocab_size, 8192)
+        logprobs = torch.empty(num_tokens, device=device, dtype=torch.float32)
+        entropy = torch.empty(num_tokens, device=device, dtype=torch.float32)
+        logz = torch.empty(num_tokens, device=device, dtype=torch.float32)
+        gathered_logprobs = torch.empty(
+            (num_tokens, extra_gather_ids.shape[1]),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            hidden_chunk = hidden[start:end]
+            labels_chunk = labels[start:end]
+            gather_ids_chunk = extra_gather_ids[start:end]
+            inv_t_chunk = inv_temperature[start:end].unsqueeze(-1)
+            chunk_tokens = end - start
+
+            running_max = torch.full((chunk_tokens,), float("-inf"), device=device, dtype=torch.float32)
+            exp_sum = torch.zeros(chunk_tokens, device=device, dtype=torch.float32)
+            weighted_sum = torch.zeros(chunk_tokens, device=device, dtype=torch.float32)
+            target_logits = torch.zeros(chunk_tokens, device=device, dtype=torch.float32)
+            gather_logits = torch.zeros_like(gather_ids_chunk, dtype=torch.float32)
+
+            for vocab_start in range(0, vocab_size, vocab_chunk_size):
+                vocab_end = min(vocab_start + vocab_chunk_size, vocab_size)
+                weight_chunk = weight[vocab_start:vocab_end]
+                scaled_logits = (hidden_chunk @ weight_chunk.t()).to(torch.float32) * inv_t_chunk
+
+                running_max, exp_sum, weighted_sum = _online_logsumexp_and_weighted_update(
+                    running_max,
+                    exp_sum,
+                    weighted_sum,
+                    scaled_logits,
+                )
+
+                label_in_chunk = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
+                if torch.any(label_in_chunk):
+                    local_labels = (labels_chunk[label_in_chunk] - vocab_start).long()
+                    target_logits[label_in_chunk] = scaled_logits[label_in_chunk, local_labels]
+
+                gather_in_chunk = (gather_ids_chunk >= vocab_start) & (gather_ids_chunk < vocab_end)
+                if torch.any(gather_in_chunk):
+                    local_ids = (gather_ids_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1)
+                    gather_logits = torch.where(
+                        gather_in_chunk,
+                        torch.gather(scaled_logits, 1, local_ids),
+                        gather_logits,
+                    )
+
+            logz_chunk = running_max + torch.log(exp_sum)
+            logz[start:end] = logz_chunk
+            logprobs[start:end] = target_logits - logz_chunk
+            entropy[start:end] = logz_chunk - weighted_sum / exp_sum
+            gathered_logprobs[start:end] = gather_logits - logz_chunk.unsqueeze(-1)
+
+        ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, extra_gather_ids)
+        ctx.chunk_size = chunk_size
+
+        # Keeping two outputs preserves the activation-offloading tracker used
+        # by the original fused head. Column 0 is the realized-token logprob.
+        combined = torch.cat([logprobs.unsqueeze(-1), gathered_logprobs], dim=-1)
+        return combined, entropy
+
+    @staticmethod
+    def backward(ctx, grad_combined: torch.Tensor, grad_entropy: torch.Tensor | None):
+        assert grad_entropy is None or torch.all(grad_entropy == 0.0), (
+            "Backward through entropy is not implemented in FusedOutputLinear"
+        )
+
+        hidden, weight, labels, inv_temperature, logz, extra_gather_ids = ctx.saved_tensors
+        grad_logprobs = grad_combined[:, 0].contiguous()
+        grad_topk = grad_combined[:, 1:].contiguous()
+        chunk_size: int = ctx.chunk_size
+
+        num_tokens = hidden.shape[0]
+        vocab_size = weight.shape[0]
+        vocab_chunk_size = min(vocab_size, 8192)
+        grad_hidden = torch.zeros_like(hidden)
+        grad_weight = torch.zeros_like(weight)
+
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            hidden_chunk = hidden[start:end]
+            labels_chunk = labels[start:end]
+            gather_ids_chunk = extra_gather_ids[start:end]
+            grad_label_chunk = grad_logprobs[start:end].to(torch.float32)
+            grad_topk_chunk = grad_topk[start:end].to(torch.float32)
+            inv_t_chunk = inv_temperature[start:end].unsqueeze(-1)
+            logz_chunk = logz[start:end]
+
+            for vocab_start in range(0, vocab_size, vocab_chunk_size):
+                vocab_end = min(vocab_start + vocab_chunk_size, vocab_size)
+                weight_chunk = weight[vocab_start:vocab_end]
+                scaled_logits = (hidden_chunk @ weight_chunk.t()).to(torch.float32) * inv_t_chunk
+                probs = torch.exp(scaled_logits - logz_chunk.unsqueeze(-1))
+
+                total_logprob_grad = grad_label_chunk + grad_topk_chunk.sum(dim=-1)
+                grad_logits = -total_logprob_grad.unsqueeze(-1) * probs
+
+                label_in_chunk = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
+                if torch.any(label_in_chunk):
+                    local_labels = (labels_chunk[label_in_chunk] - vocab_start).long()
+                    grad_logits[label_in_chunk, local_labels] += grad_label_chunk[label_in_chunk]
+
+                gather_in_chunk = (gather_ids_chunk >= vocab_start) & (gather_ids_chunk < vocab_end)
+                if torch.any(gather_in_chunk):
+                    local_ids = (gather_ids_chunk - vocab_start).clamp(0, vocab_end - vocab_start - 1)
+                    grad_logits.scatter_add_(
+                        1,
+                        local_ids,
+                        torch.where(
+                            gather_in_chunk,
+                            grad_topk_chunk,
+                            torch.zeros_like(grad_topk_chunk),
+                        ),
+                    )
+
+                grad_logits = grad_logits * inv_t_chunk
+                grad_hidden[start:end].add_(grad_logits.to(hidden.dtype) @ weight_chunk)
+                grad_weight[vocab_start:vocab_end].add_(grad_logits.to(weight.dtype).t() @ hidden_chunk)
+
+        return grad_hidden, grad_weight, None, None, None, None
+
+
 def inject_prime_lm_head(
     model: nn.Module,
     chunk_size: int | None = None,
@@ -353,6 +523,7 @@ def _patch_model_forward(model: nn.Module) -> None:
         labels: torch.Tensor | None = None,
         logits_to_keep: int = 0,
         temperature: torch.Tensor | None = None,
+        extra_gather_ids: torch.Tensor | None = None,
         **kwargs: object,
     ) -> PrimeLmOutput:
         # For VLM with images, don't create position_ids - let model compute MRoPE internally
@@ -373,11 +544,15 @@ def _patch_model_forward(model: nn.Module) -> None:
             slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else slice(None)
         )
 
-        # Pass through the wrapped lm_head
+        head_kwargs = {}
+        if extra_gather_ids is not None:
+            head_kwargs["extra_gather_ids"] = extra_gather_ids[:, slice_indices]
+
         return self.lm_head(
             hidden_states[:, slice_indices, :],
             labels[:, slice_indices] if labels is not None else None,
             temperature=temperature[:, slice_indices] if temperature is not None else None,
+            **head_kwargs,
         )
 
     # Bind the new forward to the model

@@ -489,6 +489,12 @@ class Orchestrator:
         to the train / eval sink. Both sinks return a finalized batch (or
         ``None``) from ``add()``; we just dispatch on the result."""
         while not self.stopped.is_set():
+            # The NCCL trainer intentionally skips its final weight broadcast.
+            # Enter drain mode from progress rather than waiting for one more
+            # batch (or policy version) that can never arrive.
+            if not self.draining and self.config.max_steps is not None and self.progress.step >= self.config.max_steps:
+                await self._begin_draining()
+
             if self.draining and self.dispatcher.is_idle:
                 get_logger().info("Pipeline drained, exiting main loop")
                 self.stopped.set()
@@ -507,11 +513,23 @@ class Orchestrator:
                 continue
 
             assert isinstance(rollout, TrainRollout)
-            train_batch = await self.train_sink.add(rollout)
+            min_policy_version = max(0, self.progress.step - self.config.max_off_policy_steps)
+            train_batch = await self.train_sink.add(rollout, min_policy_version=min_policy_version)
             # In drain mode any late-arriving train batch is dropped — we
             # don't want to ship past ``max_steps``
             if train_batch is not None and not self.draining and not self.stopped.is_set():
                 await self.finalize_train_batch(train_batch)
+
+    async def _begin_draining(self) -> None:
+        """Stop scheduling train work and cancel any trailing train rollouts."""
+        if self.draining:
+            return
+        self.draining = True
+        self.dispatcher.disable_train_scheduling()
+        n_cancelled = await self.dispatcher.cancel_inflight_train_rollouts()
+        get_logger().info(
+            f"Draining pipeline (cancelled {n_cancelled} in-flight train rollout(s); any in-flight evals will complete)"
+        )
 
     async def _drain_token_export_metrics(self) -> None:
         """Token exports lag the orchestrator, so once the loop ends the trainer is
@@ -560,13 +578,7 @@ class Orchestrator:
         save_ckpt_time = await self.maybe_save_ckpt(step)
 
         if config.max_steps is not None and step >= config.max_steps:
-            self.draining = True
-            self.dispatcher.disable_train_scheduling()
-            n_cancelled = await self.dispatcher.cancel_inflight_train_rollouts()
-            get_logger().info(
-                f"Draining pipeline (cancelled {n_cancelled} in-flight train rollout(s); "
-                f"any in-flight evals will complete)"
-            )
+            await self._begin_draining()
             return
 
         if batch.metrics.n_trainable == 0:
@@ -588,6 +600,14 @@ class Orchestrator:
                 f"({batch.metrics.n_trainable / len(batch.rollouts):.1%}) — consider reviewing task difficulty / filter config"
             )
 
+        min_policy_version = max(0, step - config.max_off_policy_steps)
+        stale_versions = [r.policy_version for r in batch.rollouts if r.policy_version < min_policy_version]
+        if stale_versions:
+            raise RuntimeError(
+                f"Step {step} contains {len(stale_versions)} rollout(s) older than policy v{min_policy_version}: "
+                f"versions={sorted(set(stale_versions))}"
+            )
+
         # Materialize at the I/O boundary so prime-rl metadata travels with
         # the raw vf payload on disk + in wandb sample tables
         rollout_dicts = [r.to_dict() for r in batch.rollouts]
@@ -604,9 +624,12 @@ class Orchestrator:
                 clients=self.teacher_inference.train_clients,
                 model_name=config.teacher.model.name,
                 samples=batch.samples,
+                top_k=config.opd_top_k,
             )
-            for ex, lp in zip(batch.samples, teacher_logprobs_list):
-                ex.teacher_logprobs = lp
+            for ex, scores in zip(batch.samples, teacher_logprobs_list):
+                ex.teacher_logprobs = scores.logprobs
+                ex.teacher_topk_token_ids = scores.topk_token_ids
+                ex.teacher_topk_logprobs = scores.topk_logprobs
             teacher_logprobs_time = time.perf_counter() - t
 
         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
@@ -758,13 +781,14 @@ class Orchestrator:
         trainable_rate = (n_trainable / n_survivors) if n_survivors else 0.0
         reward_mean = sum(r.reward for r in batch.rollouts) / max(n_survivors, 1)
         max_off_policy = max((r.off_policy_steps for r in batch.rollouts), default=0)
+        max_policy_lag = max((max(0, step - r.policy_version) for r in batch.rollouts), default=0)
         turns_mean = sum(len(r.raw.get("trajectory") or []) for r in batch.rollouts) / max(n_survivors, 1)
         truncation_rate = sum(1 for r in batch.rollouts if r.is_truncated) / max(n_survivors, 1)
 
         head = (
             f"Step {step} | {format_time(step_time):>7} | Reward {reward_mean:.4f} | "
             f"Trainable {n_trainable}/{n_survivors} ({trainable_rate:.1%}) | "
-            f"Turns {turns_mean:.1f} | Max Off-Policy {max_off_policy} | "
+            f"Turns {turns_mean:.1f} | Max Off-Policy {max_off_policy} | Max Policy Lag {max_policy_lag} | "
             f"Error {error_rate:.1%} | Truncation {truncation_rate:.1%}"
         )
         if len(self.train_envs) <= 1:

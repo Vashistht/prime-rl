@@ -41,6 +41,7 @@ class MetricsBuilder:
         existing dashboards / alerts keep working."""
         num_rollouts = len(rollouts)
         num_unique_examples = len({r.group_id for r in rollouts})
+        policy_lags = [max(0, step - r.policy_version) for r in rollouts]
         num_tokens = sum(
             r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"] for r in rollouts
         )
@@ -92,6 +93,8 @@ class MetricsBuilder:
             "progress/total_tokens": progress.total_tokens,
             "progress/total_samples": progress.total_samples,
             "progress/total_problems": progress.total_problems,
+            "policy_lag/all/max": max(policy_lags, default=0),
+            "policy_lag/all/mean": sum(policy_lags) / max(num_rollouts, 1),
             "seq_len/all/mean": by_example.seq_len.mean().mean(),
             "seq_len/all/max": by_example.seq_len.mean().max(),
             "seq_len/all/min": by_example.seq_len.mean().min(),

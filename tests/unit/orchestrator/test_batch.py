@@ -9,7 +9,7 @@ from prime_rl.trainer.batch import (
     prepare_sample,
 )
 from prime_rl.trainer.utils import build_bin_cost
-from prime_rl.transport.types import MicroBatch, RoutedExperts, TrainingSample
+from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TrainingSample
 
 
 def _routed_experts(data, dtype=np.uint8):
@@ -265,3 +265,36 @@ def test_prepare_sample_truncates_routed_experts():
     assert micro_batch.routed_experts is not None
     assert micro_batch.routed_experts == expected_payload
     assert micro_batch.env_names == ["test-env"] * 3
+
+
+def test_prepare_sample_truncates_and_pads_teacher_topk():
+    ids = np.arange(8, dtype=np.int32).reshape(4, 2)
+    logprobs = np.linspace(-0.1, -0.8, 8, dtype=np.float32).reshape(4, 2)
+    sample = TrainingSample(
+        prompt_ids=[1, 2],
+        prompt_mask=[False, False],
+        completion_ids=[3, 4],
+        completion_mask=[True, True],
+        completion_logprobs=[-0.1, -0.2],
+        completion_temperatures=[1.0, 1.0],
+        teacher_logprobs=[0.0] * 4,
+        advantage=0.0,
+        env_name="test-env",
+        training_mode="opd",
+        teacher_topk_token_ids=EncodedTensor.from_numpy(ids),
+        teacher_topk_logprobs=EncodedTensor.from_numpy(logprobs),
+    )
+
+    micro_batch = prepare_sample(sample, seq_len=3)
+    micro_batch = pad_micro_batch(micro_batch, pad_to_multiple_of=4)
+    packed_ids = np.frombuffer(micro_batch.teacher_topk_token_ids.data, dtype=np.int32).reshape(
+        micro_batch.teacher_topk_token_ids.shape
+    )
+    packed_logprobs = np.frombuffer(micro_batch.teacher_topk_logprobs.data, dtype=np.float32).reshape(
+        micro_batch.teacher_topk_logprobs.shape
+    )
+
+    assert packed_ids[:3].tolist() == ids[:3].tolist()
+    np.testing.assert_allclose(packed_logprobs[:3], logprobs[:3])
+    assert packed_ids[3].tolist() == [0, 0]
+    assert packed_logprobs[3].tolist() == [-1e9, -1e9]

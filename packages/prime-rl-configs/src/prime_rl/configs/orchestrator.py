@@ -499,6 +499,13 @@ class OrchestratorConfig(BaseConfig):
     training_mode: Literal["rl", "opd", "sft"] = "rl"
     """Training mode. ``rl``: student generates rollouts, no teacher. ``opd``: student generates rollouts, teacher computes logprobs (teacher_tau > 0). ``sft``: teacher generates rollouts, student inference pool used for evals and weight sync."""
 
+    opd_top_k: int | None = Field(None, ge=1)
+    """When set in ``opd`` mode, distill on the union of the teacher's top-k
+    tokens and the realized student token. Teacher and student probabilities
+    retain their full-vocabulary normalization; the selected support is not
+    renormalized and a sampled token already in the teacher top-k is counted
+    only once."""
+
     student: RolloutModelConfig = Field(RolloutModelConfig(), validation_alias=AliasChoices("student", "model"))
     """Student rollout participant (model + client) — the model being trained."""
 
@@ -765,6 +772,8 @@ class OrchestratorConfig(BaseConfig):
             raise ValueError("orchestrator.teacher must not be set when training_mode = 'rl'.")
         if self.training_mode == "opd" and not has_teacher:
             raise ValueError("orchestrator.teacher must be configured when training_mode = 'opd'.")
+        if self.training_mode != "opd" and self.opd_top_k is not None:
+            raise ValueError("orchestrator.opd_top_k is only valid when training_mode = 'opd'.")
         return self
 
     @model_validator(mode="after")

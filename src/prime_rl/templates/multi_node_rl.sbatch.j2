@@ -190,6 +190,12 @@ srun bash -s <<'CLEANUP_SH'
     echo "[node-cleanup] $(hostname) procs=$procs gpu_mem=${gpu}MiB"
 CLEANUP_SH
 
+# The srun tasks coordinate clean completion through this per-job directory on
+# the shared output filesystem.  A unique job id keeps retries isolated from
+# stale completion markers without requiring destructive cleanup.
+export LIFECYCLE_DIR="$OUTPUT_DIR/.slurm_lifecycle/job_${SLURM_JOB_ID}_restart_${SLURM_RESTART_COUNT:-0}"
+mkdir -p "$LIFECYCLE_DIR"
+
 # Run RL
 # --kill-on-bad-exit=1 propagates a non-zero exit on any node to all other
 # tasks so a crashed component terminates the SLURM job instead of leaving the
@@ -199,6 +205,11 @@ srun --kill-on-bad-exit=1 bash -c '
     # wait/cleanup block at the end of this script surfaces background
     # process crashes (router, orchestrator) as task failures.
     set -o pipefail
+
+    TRAINER_PID=""
+    ORCHESTRATOR_PID=""
+    IS_INFER_NODE=0
+    IS_ORCHESTRATOR_NODE=0
 
     # Source environment
     cd $PROJECT_DIR
@@ -217,6 +228,7 @@ srun --kill-on-bad-exit=1 bash -c '
 {% if num_infer_nodes > 0 -%}
 
 if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
+    IS_INFER_NODE=1
     export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
     INFER_NODE_RANK=$SLURM_PROCID
     export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -406,46 +418,130 @@ else
         -m prime_rl.trainer.rl.train \
         @ $CONFIG_DIR/trainer.toml \
         2>&1 | sed -u 's/^\[[a-zA-Z]*[0-9]*\]://' | tee -a $OUTPUT_DIR/logs/trainer/node_${TRAIN_NODE_RANK}.log &
+    TRAINER_PID=$!
 {% if num_infer_nodes > 0 %}    fi{% endif %}
 {% if num_infer_nodes > 0 %}
 # Launch the orchestrator on one node. Default is trainer rank 0 (SLURM_PROCID ==
 # NUM_INFER_NODES). With orchestrator_on_inference it moves to the last inference node
 # (a decode node) to keep its rollout buffer + env workers off host-RAM-saturated
-# trainer nodes. Top-level (after the role if/else) so the wait -n teardown covers it.
+# trainer nodes. It remains a top-level job so the lifecycle loop can identify it.
 {% if orchestrator_on_inference %}ORCH_PROCID=$((NUM_INFER_NODES - 1)){% else %}ORCH_PROCID=$NUM_INFER_NODES{% endif %}
 if [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
+    IS_ORCHESTRATOR_NODE=1
     ORCHESTRATOR_ARGS="@ $CONFIG_DIR/orchestrator.toml"
     ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --student.client.base-url $INFER_URLS"
     ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --student.client.admin-base-url $ADMIN_URLS"
     {% if use_nccl_broadcast %}ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --weight_broadcast.host $MASTER_ADDR"
     {% endif %}WANDB_SHARED_LABEL=orchestrator uv run orchestrator $ORCHESTRATOR_ARGS \
         2>&1 | tee $OUTPUT_DIR/logs/orchestrator.log &
+    ORCHESTRATOR_PID=$!
 fi
 {% endif %}
 
-# Wait for the first background job to exit and propagate its exit code. This
-# turns background process crashes (router, orchestrator) into task failures
-# that --kill-on-bad-exit=1 can broadcast to the other nodes so the whole job
-# tears down instead of leaving zombies holding the allocation.
-wait -n
-EXIT_CODE=$?
-REMAINING_PIDS=$(jobs -p)
-{%- if cleanup_grace_period %}
-# Cross-node teardown is driven by `srun --kill-on-bad-exit=1`, which reaps peer
-# tasks only once a task *exits* non-zero. So on a non-zero exit (crash, SIGTERM,
-# wall-time) we stay alive for the grace period and signal nothing: this lets an
-# in-flight trainer checkpoint on this node finish, and — because the task has
-# not exited yet — keeps --kill-on-bad-exit from reaping checkpointing trainers
-# on peer nodes. We then propagate the exit code so the allocation tears down. A
-# clean (zero) exit cannot trip --kill-on-bad-exit, so we tear down immediately.
-if [ "$EXIT_CODE" -ne 0 ]; then
-    echo "[$(hostname)] component exited with code $EXIT_CODE - waiting up to {{ cleanup_grace_period }}s for in-flight checkpoints to flush before teardown"
-    sleep {{ cleanup_grace_period }}
+# Trainer and orchestrator PIDs are tracked separately because either may
+# finish first on the orchestrator node. Any other launched job on an inference
+# node is a service and an exit before coordinated shutdown is a failure, even
+# when its exit code is 0.
+
+terminate_local_components() {
+    local pid
+    for pid in $(jobs -p); do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+}
+
+fail_component() {
+    local name="$1" raw_code="$2" code="$2"
+    if [ "$code" -eq 0 ]; then code=1; fi
+    echo "[$(hostname)] $name exited before coordinated shutdown (code $code)"
+{% if cleanup_grace_period %}
+    # Preserve the configured checkpoint-flush window for genuine component
+    # failures. An unexpected clean service exit is promoted to failure but
+    # has no checkpoint in flight, so it can tear down immediately.
+    if [ "$raw_code" -ne 0 ]; then
+        echo "[$(hostname)] waiting up to {{ cleanup_grace_period }}s for in-flight checkpoints to flush before teardown"
+        sleep {{ cleanup_grace_period }}
+    fi
+{% endif %}
+    terminate_local_components
+    exit "$code"
+}
+
+wait_for_shutdown() {
+    while [ ! -f "$LIFECYCLE_DIR/shutdown" ]; do sleep 1; done
+}
+wait_for_shutdown &
+SHUTDOWN_WAITER_PID=$!
+
+# The orchestrator task alone watches shared trainer completion. This keeps the
+# protocol valid when the orchestrator runs on an inference node and has no
+# local trainer process.
+COORDINATOR_PID=""
+if [ -n "$ORCHESTRATOR_PID" ]; then
+    wait_for_global_completion() {
+        while true; do
+            if [ -f "$LIFECYCLE_DIR/orchestrator.done" ]; then
+                ALL_TRAINERS_FINISHED=1
+                for ((rank=0; rank<NUM_TRAIN_NODES; rank++)); do
+                    if [ ! -f "$LIFECYCLE_DIR/trainer_${rank}.done" ]; then
+                        ALL_TRAINERS_FINISHED=0
+                        break
+                    fi
+                done
+                if [ "$ALL_TRAINERS_FINISHED" -eq 1 ]; then
+                    touch "$LIFECYCLE_DIR/shutdown"
+                    return 0
+                fi
+            fi
+            sleep 1
+        done
+    }
+    wait_for_global_completion &
+    COORDINATOR_PID=$!
 fi
-{%- endif %}
-echo "[$(hostname)] tearing down (exit code $EXIT_CODE) - terminating remaining processes"
-for pid in $REMAINING_PIDS; do
-    kill -TERM $pid 2>/dev/null || true
+
+while true; do
+    # wait -n preserves pipefail status for background pipelines, unlike
+    # waiting directly on $!, which would only report the trailing tee status.
+    FINISHED_PID=""
+    wait -n -p FINISHED_PID
+    CODE=$?
+
+    if [ "$FINISHED_PID" = "$SHUTDOWN_WAITER_PID" ] || { [ -n "$COORDINATOR_PID" ] && [ "$FINISHED_PID" = "$COORDINATOR_PID" ]; }; then
+        if [ "$CODE" -ne 0 ] || [ ! -f "$LIFECYCLE_DIR/shutdown" ]; then
+            fail_component lifecycle-coordinator "$CODE"
+        fi
+        echo "[$(hostname)] orchestrator and all trainer ranks completed; coordinated shutdown"
+        terminate_local_components
+        exit 0
+    fi
+
+    if [ -n "$TRAINER_PID" ] && [ "$FINISHED_PID" = "$TRAINER_PID" ]; then
+        if [ "$CODE" -ne 0 ]; then fail_component trainer "$CODE"; fi
+        touch "$LIFECYCLE_DIR/trainer_${TRAIN_NODE_RANK}.done"
+        echo "[$(hostname)] trainer rank $TRAIN_NODE_RANK completed"
+        if [ "$IS_ORCHESTRATOR_NODE" -eq 0 ]; then
+            terminate_local_components
+            exit 0
+        fi
+        TRAINER_PID=""
+        continue
+    fi
+
+    if [ -n "$ORCHESTRATOR_PID" ] && [ "$FINISHED_PID" = "$ORCHESTRATOR_PID" ]; then
+        if [ "$CODE" -ne 0 ]; then fail_component orchestrator "$CODE"; fi
+        touch "$LIFECYCLE_DIR/orchestrator.done"
+        echo "[$(hostname)] orchestrator completed; waiting for all trainer ranks"
+        ORCHESTRATOR_PID=""
+        continue
+    fi
+
+    # Every remaining component is an inference service. Surface an early clean
+    # exit as code 1 so --kill-on-bad-exit tears down every peer task immediately.
+    if [ "$IS_INFER_NODE" -eq 1 ]; then
+        fail_component "inference service $FINISHED_PID" "$CODE"
+    fi
+
+    fail_component "unexpected component $FINISHED_PID" "$CODE"
 done
-exit $EXIT_CODE
 '
