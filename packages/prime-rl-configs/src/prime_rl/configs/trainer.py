@@ -412,6 +412,11 @@ class CheckpointConfig(BaseConfig):
 class DefaultLossConfig(BaseConfig):
     type: Literal["default"] = "default"
 
+    opd_top_k_objective: Literal["topk_plus_sampled", "mopd_eq5"] = "topk_plus_sampled"
+    """Sparse OPD objective. ``mopd_eq5`` is the bias-corrected teacher-top-k
+    generalized KL from MOPD Eq. 5; the default preserves the earlier
+    teacher-top-k-plus-sampled-token ablation."""
+
     dppo_mask_low: float = Field(0.2, ge=0)
     """Lower DPPO masking threshold."""
 
@@ -510,7 +515,8 @@ class TrainerConfig(BaseConfig):
     data: DataLoaderConfig = DataLoaderConfig()
 
     loss: LossConfig = DefaultLossConfig()
-    """Loss config for rl-mode batches. opd and sft batches dispatch to their own loss fns unconditionally and do not read this."""
+    """Loss config for rl-mode batches. OPD additionally reads
+    ``DefaultLossConfig.opd_top_k_objective``; SFT remains independent."""
 
     optim: OptimizerConfig = AdamWConfig()
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import torch
 from beartype import beartype as typechecker
@@ -197,7 +197,10 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: IPOLossConfig) -> LossOutputs:
     return LossOutputs(loss=loss, metrics=metrics)
 
 
-def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
+def opd_loss_fn(
+    inputs: LossInputs,
+    topk_objective: Literal["topk_plus_sampled", "mopd_eq5"] = "topk_plus_sampled",
+) -> LossOutputs:
     """
     On-policy distillation loss: the default DPPO+KL math with the tau knobs
     hardcoded to drop the reward signal and use the teacher KL as the
@@ -219,22 +222,54 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
         raise ValueError("Teacher and student top-k logprobs must be provided together.")
 
     if has_teacher_topk:
-        if inputs.sampled_token_in_teacher_topk is None:
-            raise ValueError("Top-k OPD requires sampled-token membership in the teacher top-k.")
-
-        # Teacher top-k union the realized student token. This follows the
-        # augmented-support reverse-KL formulation in Peter's OPD branch:
-        #   sum_{v in top-k(teacher) U {sample}} p_s(v) log(p_s(v) / p_t(v)).
-        # Both distributions retain their full-vocabulary normalization. The
-        # sampled term is added only when it is outside the teacher top-k, so
-        # a token already on the sparse support is never double counted.
         student_logp = inputs.student_topk_logprobs
         teacher_logp = inputs.teacher_topk_logprobs
         student_p = torch.exp(student_logp)
         teacher_p = torch.exp(teacher_logp)
+        per_token_topk_rkl = (student_p * (student_logp - teacher_logp)).sum(dim=-1)
+
+        # MOPD Eq. 5 is a generalized KL (I-divergence) over the teacher's
+        # top-k support. The -p_s + p_t correction is essential: unlike a
+        # naively truncated reverse KL, its gradient vanishes when the student
+        # and teacher probabilities agree on every selected token. Gathered
+        # logprobs retain their full-vocabulary normalization.
+        per_token_mopd_eq5 = per_token_topk_rkl - student_p.sum(dim=-1) + teacher_p.sum(dim=-1)
+
+        common_metrics = {
+            "teacher_kl": _safe_mean(teacher_kl, loss_mask),
+            # Monte Carlo estimate of full-vocabulary KL(behavior || teacher)
+            # on tokens sampled from the inference/behavior policy. Using the
+            # trainer logprob here would be biased whenever the rollout is one
+            # policy version behind. Keep this token-level so the distributed
+            # metric collector forms the true global token mean.
+            "sampled_reverse_kl": (inference_logprobs - teacher_logprobs)[loss_mask],
+            "topk_reverse_kl": per_token_topk_rkl[loss_mask],
+            "mopd_eq5_topk_divergence": per_token_mopd_eq5[loss_mask],
+            "topk_student_mass": student_p.sum(dim=-1)[loss_mask],
+            "topk_teacher_mass": teacher_p.sum(dim=-1)[loss_mask],
+        }
+
+        if topk_objective == "mopd_eq5":
+            loss = (loss_mask * per_token_mopd_eq5).sum()
+            common_metrics["mopd_eq5_sequence_mean"] = _safe_mean(per_token_mopd_eq5, loss_mask)
+            if inputs.sampled_token_in_teacher_topk is not None:
+                common_metrics["sampled_token_in_teacher_topk"] = inputs.sampled_token_in_teacher_topk[
+                    loss_mask
+                ].float()
+            return LossOutputs(loss=loss, metrics=common_metrics)
+
+        if topk_objective != "topk_plus_sampled":
+            raise ValueError(f"Unknown top-k OPD objective: {topk_objective!r}")
+        if inputs.sampled_token_in_teacher_topk is None:
+            raise ValueError("Top-k-plus-sampled OPD requires sampled-token membership in the teacher top-k.")
+
+        # Teacher top-k union the realized student token. This follows the
+        # augmented-support reverse-KL formulation in Peter's OPD branch:
+        #   sum_{v in top-k(teacher) U {sample}} p_s(v) log(p_s(v) / p_t(v)).
+        # The sampled term is added only when it is outside the teacher top-k,
+        # so a token already on the sparse support is never double counted.
         sampled_in_topk = inputs.sampled_token_in_teacher_topk
         sampled_outside_topk = ~sampled_in_topk
-        per_token_topk_rkl = (student_p * (student_logp - teacher_logp)).sum(dim=-1)
         sampled_student_p = torch.exp(trainer_logprobs)
         sampled_teacher_p = torch.exp(teacher_logprobs)
         sampled_rkl_term = sampled_student_p * (trainer_logprobs - teacher_logprobs)
@@ -247,18 +282,9 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
         augmented_teacher_mass = teacher_p.sum(dim=-1) + sampled_outside_topk * sampled_teacher_p
         loss = (loss_mask * per_token_augmented_rkl).sum()
         metrics = {
-            "teacher_kl": _safe_mean(teacher_kl, loss_mask),
-            # Monte Carlo estimate of full-vocabulary KL(behavior || teacher)
-            # on tokens sampled from the inference/behavior policy. Using the
-            # trainer logprob here would be biased whenever the rollout is one
-            # policy version behind. Keep this token-level so the distributed
-            # metric collector forms the true global token mean.
-            "sampled_reverse_kl": (inference_logprobs - teacher_logprobs)[loss_mask],
-            "topk_reverse_kl": per_token_topk_rkl[loss_mask],
+            **common_metrics,
             "topk_plus_sampled_reverse_kl": per_token_augmented_rkl[loss_mask],
             "sampled_token_in_teacher_topk": sampled_in_topk[loss_mask].float(),
-            "topk_student_mass": student_p.sum(dim=-1)[loss_mask],
-            "topk_teacher_mass": teacher_p.sum(dim=-1)[loss_mask],
             "topk_plus_sampled_student_mass": augmented_student_mass[loss_mask],
             "topk_plus_sampled_teacher_mass": augmented_teacher_mass[loss_mask],
         }
@@ -320,13 +346,14 @@ def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
     per batch from ``TrainingSample.training_mode``:
 
     - ``"sft"`` → ``sft_loss_fn`` (masked NLL on teacher tokens)
-    - ``"opd"`` → ``opd_loss_fn`` (teacher KL as gradient signal, hardcoded
-      DPPO + KL knobs)
+    - ``"opd"`` → ``opd_loss_fn`` (teacher KL policy-gradient form, or the
+      sparse objective selected by ``DefaultLossConfig.opd_top_k_objective``)
     - ``"rl"``  → ``default_loss_fn(loss_config)`` for ``DefaultLossConfig``,
       ``ipo_loss_fn(loss_config)`` for ``IPOLossConfig``, or the imported
       function for ``CustomLossConfig``.
 
-    ``trainer.loss`` only affects the rl path - opd and sft are independent.
+    Apart from ``DefaultLossConfig.opd_top_k_objective``, ``trainer.loss`` only
+    affects the rl path; sft is independent.
     """
     if isinstance(loss_config, CustomLossConfig):
         custom_fn = import_object(loss_config.import_path)
@@ -343,7 +370,14 @@ def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
         def rl_fn(inputs: LossInputs) -> LossOutputs:
             return default_loss_fn(inputs, loss_config)
 
-    return {"sft": sft_loss_fn, "opd": opd_loss_fn, "rl": rl_fn}
+    topk_objective = (
+        loss_config.opd_top_k_objective if isinstance(loss_config, DefaultLossConfig) else "topk_plus_sampled"
+    )
+
+    def opd_fn(inputs: LossInputs) -> LossOutputs:
+        return opd_loss_fn(inputs, topk_objective=topk_objective)
+
+    return {"sft": sft_loss_fn, "opd": opd_fn, "rl": rl_fn}
 
 
 def compute_loss(

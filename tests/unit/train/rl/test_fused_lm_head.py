@@ -128,6 +128,57 @@ def test_fused_teacher_topk_plus_sample_matches_dense_forward_and_backward_cpu()
     torch.testing.assert_close(fused.weight.grad, weight_dense.grad, rtol=0, atol=1e-5)
 
 
+def test_fused_teacher_topk_mopd_eq5_matches_dense_forward_and_backward_cpu():
+    """Sparse fused gathers preserve the bias-corrected MOPD Eq. 5 gradient."""
+    torch.manual_seed(19)
+    batch, seq, hidden_size, vocab_size, k = 1, 4, 7, 19, 5
+    temperature = torch.ones((batch, seq), dtype=torch.float32)
+
+    teacher_logits = torch.randn(batch, seq, vocab_size)
+    teacher_logprobs = torch.log_softmax(teacher_logits, dim=-1)
+    teacher_topk_ids = teacher_logits.topk(k, dim=-1).indices
+    teacher_topk_logprobs = teacher_logprobs.gather(-1, teacher_topk_ids)
+    labels = torch.randint(0, vocab_size, (batch, seq))
+    teacher_sampled_logprobs = teacher_logprobs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
+    hidden_dense = torch.randn(batch, seq, hidden_size, requires_grad=True)
+    weight_dense = torch.randn(vocab_size, hidden_size, requires_grad=True)
+    dense_logprobs = torch.log_softmax(hidden_dense @ weight_dense.t(), dim=-1)
+    dense_student_topk = dense_logprobs.gather(-1, teacher_topk_ids)
+    student_p = dense_student_topk.exp()
+    teacher_p = teacher_topk_logprobs.exp()
+    dense_loss = (student_p * (dense_student_topk - teacher_topk_logprobs) - student_p + teacher_p).sum()
+    dense_loss.backward()
+
+    hidden_fused = hidden_dense.detach().clone().requires_grad_(True)
+    fused = FusedOutputLinear(hidden_size, vocab_size, chunk_size=3)
+    fused.weight = torch.nn.Parameter(weight_dense.detach().clone())
+    output = fused(
+        hidden_fused,
+        labels=labels,
+        temperature=temperature,
+        extra_gather_ids=teacher_topk_ids,
+    )
+    result = opd_loss_fn(
+        LossInputs(
+            trainer_logprobs=output["logprobs"].reshape(-1),
+            inference_logprobs=output["logprobs"].detach().reshape(-1),
+            teacher_logprobs=teacher_sampled_logprobs.reshape(-1),
+            advantages=torch.zeros(seq),
+            loss_mask=torch.ones(seq, dtype=torch.bool),
+            teacher_topk_logprobs=teacher_topk_logprobs.reshape(seq, k),
+            student_topk_logprobs=output["topk_logprobs"].reshape(seq, k),
+        ),
+        topk_objective="mopd_eq5",
+    )
+    result.loss.backward()
+
+    torch.testing.assert_close(output["topk_logprobs"], dense_student_topk, rtol=0, atol=1e-5)
+    torch.testing.assert_close(result.loss, dense_loss.detach(), rtol=0, atol=1e-5)
+    torch.testing.assert_close(hidden_fused.grad, hidden_dense.grad, rtol=0, atol=1e-5)
+    torch.testing.assert_close(fused.weight.grad, weight_dense.grad, rtol=0, atol=1e-5)
+
+
 def test_fused_teacher_topk_alignment_for_packed_sequences_and_padding_cpu():
     """Production shifts keep teacher rows aligned across packed boundaries and padding."""
     torch.manual_seed(23)
