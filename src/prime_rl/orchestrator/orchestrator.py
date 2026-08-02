@@ -885,9 +885,19 @@ class Orchestrator:
         sites: after shipping a batch (step advances) and from
         ``on_new_version`` (policy advances)."""
         lead = (self.progress.step + 1) - self.policy.version
+        # The NCCL trainer deliberately does not publish the final policy
+        # update. Once only the last batch remains, let it use the immediately
+        # preceding policy when the configured off-policy budget permits it.
+        # Keep the normal pipeline gate unchanged for every earlier batch.
+        terminal_penultimate_policy = (
+            self.config.max_steps is not None
+            and self.progress.step == self.config.max_steps - 1
+            and self.policy.version == self.progress.step - 1
+            and self.config.max_off_policy_steps >= 1
+        )
         gate = self.dispatcher.dispatch_allowed
         was_set = gate.is_set()
-        if lead > TARGET_LAG:
+        if lead > TARGET_LAG and not terminal_penultimate_policy:
             if was_set:
                 get_logger().info(
                     "Pausing dispatcher to prevent orchestrator from racing from trainer. Waiting for new policy..."
