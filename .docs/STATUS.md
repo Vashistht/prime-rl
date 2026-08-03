@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 19:22 PDT.
+Last updated: 2026-08-02 20:14 PDT.
 
 ## Code
 
@@ -41,6 +41,17 @@ Last updated: 2026-08-02 19:22 PDT.
   the paper-matched 32,768-token cap; GPQA-Diamond had no truncations. The
   complete evaluator allocation averaged `90.3%` GPU utilization including
   startup/shutdown and `97.4%` over active samples.
+- Step 10 checkpoint/eval: stable and completed successfully (Slurm
+  `2825946`, exit 0). Avg@8 results were AIME25 `71.25%` (171/240), AIME26
+  `75.00%` (180/240), and GPQA-Diamond `63.19%` (1,001/1,584). Baseline was
+  `73.75%`, `74.58%`, and `62.94%`, so the trajectory remains mixed rather
+  than collapsed. AIME25/AIME26 had 24/15 capped samples; GPQA had none.
+  End-to-end evaluator GPU utilization was `90.0%`, or `96.9%` over active
+  samples.
+- At step 10 the Eq. 5 divergence was `0.18510`, sampled reverse KL was
+  `0.18599`, and entropy was `0.26604`, versus `0.18837`, `0.18874`, and
+  `0.25959` initially. These diagnostics do not yet show the paper's reported
+  catastrophic regime.
 
 ## Matched Base-student control
 
@@ -79,6 +90,9 @@ Requested comparison:
   The Base control degrades overall but does not exhibit a numerical crash.
 - The Base teacher service `2825629` was released immediately after training;
   checkpoint evaluation uses only the saved student weights.
+- W&B currently labels this Base run `crashed`, but Slurm `2825644` exited 0,
+  checkpoint 25 is stable, and all checkpoint evaluations completed. Treat the
+  dashboard state as a multi-process finalization artifact, not a run failure.
 - Safety walltime: 24 hours for RL and 26 hours for the teacher; all scientific
   settings remain matched and BF16-only.
 
