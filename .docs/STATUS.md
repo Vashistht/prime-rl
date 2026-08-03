@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 20:14 PDT.
+Last updated: 2026-08-02 21:40 PDT.
 
 ## Code
 
@@ -11,7 +11,7 @@ Last updated: 2026-08-02 20:14 PDT.
 - Container preflight, including fused sparse value and gradient parity:
   17 passed.
 
-## Active DAPO Eq. 5 run
+## Original DAPO Eq. 5 run (operationally interrupted)
 
 - Student: `Qwen/Qwen3-30B-A3B`
 - Teacher: `Qwen/Qwen3-235B-A22B`
@@ -21,9 +21,7 @@ Last updated: 2026-08-02 20:14 PDT.
 - W&B: <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/a49312a48fa144d7b019f25e14d6d437>
 - Checkpoint evaluator: watches steps 5/10/15/20/25 and submits serial
   AIME25/AIME26/GPQA-Diamond avg@8 jobs.
-- Current state at this update: both teacher and Prime-RL jobs are running;
-  optimizer updates through policy version 6 completed without errors. At
-  step 0, the corrected token-weighted teacher/student divergence was
+- The corrected token-weighted teacher/student divergence at step 0 was
   `0.18837`, sampled reverse KL was `0.18874`, and student entropy was
   `0.25959`. This independently matches the paper's reported external-teacher
   initial KL of approximately `0.19`.
@@ -52,6 +50,41 @@ Last updated: 2026-08-02 20:14 PDT.
   `0.18599`, and entropy was `0.26604`, versus `0.18837`, `0.18874`, and
   `0.25959` initially. These diagnostics do not yet show the paper's reported
   catastrophic regime.
+- Step 15 checkpoint/eval: stable and completed successfully (Slurm
+  `2826145`, exit 0). Avg@8 results were AIME25 `73.33%` (176/240), AIME26
+  `74.17%` (178/240), and GPQA-Diamond `61.87%` (980/1,584). AIME25/AIME26
+  had 19/14 capped samples and GPQA had one. At step 15, Eq. 5 divergence was
+  `0.18248`, sampled reverse KL was `0.18294`, and entropy was `0.27317`.
+- Training completed optimizer update 17 without numerical errors, rollout
+  errors, or evidence of collapse. At approximately 21:17 PDT, Slurm
+  preempted teacher job `2824700` and requeued it on different hosts. The
+  running Prime-RL job retained the original fixed teacher endpoints and
+  consequently failed with connection errors during update 18 (Slurm
+  `2825083`, exit 143). This is an infrastructure interruption, not the
+  scientific failure mode under test.
+- This run saved HF weights only. Stable steps 5, 10, and 15 are valid, but no
+  optimizer/scheduler state exists, so an exact continuation is impossible.
+
+## Active clean DAPO recovery run
+
+- Run name:
+  `table4-qwen30b-original235b-mopd-eq5-topk64-dapo17k-b2048-g2-rerun1-20260802`.
+- Teacher: Slurm `2826432`, one TP4 node. The compact live preflight passed
+  with HTTP 200 and validated teacher-top-64 token/log-prob tensor shapes.
+- Prime-RL: Slurm `2826440`, 12 nodes (10 generation, 2 trainer), submitted
+  after the live teacher gate; queued for resources at this update.
+- Scientific settings are unchanged from the original run: exact student and
+  teacher snapshots, DAPO split, Eq. 5 top-64 objective, batch 2,048 as 1,024
+  prompts x 2 samples, 32,768-token cap, temperature 1.0 without sampling
+  truncation, LR `1e-6`, 25 updates, and BF16 only.
+- The recovery uses one teacher node because the two original teacher nodes
+  averaged only about 33% wall-clock GPU utilization each. One node reduces
+  allocation/preemption exposure while retaining the same TP4 server and
+  projects to roughly 67% combined wall-clock utilization.
+- Trainer checkpoints now include optimizer, scheduler, progress, and
+  dataloader state every five steps (`weights_only = false`) in addition to HF
+  weight exports. The persistent evaluator watches stable steps 5/10/15/20/25
+  and submits serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs.
 
 ## Matched Base-student control
 
