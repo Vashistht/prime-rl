@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 21:46 PDT.
+Last updated: 2026-08-02 23:25 PDT.
 
 ## Code
 
@@ -69,30 +69,42 @@ Last updated: 2026-08-02 21:46 PDT.
 
 - Run name:
   `table4-qwen30b-original235b-mopd-eq5-topk64-dapo17k-b2048-g2-rerun1-20260802`.
+- This is a fresh run after the original job's teacher-service preemption. The
+  original interruption was infrastructural, not a scientific collapse; this
+  recovery is configured with resumable full-state checkpoints.
 - Teacher: Slurm `2826432`, one TP4 node. The compact live preflight passed
   with HTTP 200 and validated teacher-top-64 token/log-prob tensor shapes.
 - Prime-RL: Slurm `2826440`, 12 nodes (10 generation, 2 trainer), submitted
   after the live teacher gate and running since 21:40 PDT.
 - W&B:
   <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/cab787732c794f52bf13126cf9691dfe>
-- Scientific settings are unchanged from the original run: exact student and
-  teacher snapshots, DAPO split, Eq. 5 top-64 objective, batch 2,048 as 1,024
+- Scientific settings are unchanged from the original run: student
+  `Qwen/Qwen3-30B-A3B` at
+  `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`, teacher
+  `Qwen/Qwen3-235B-A22B` at
+  `8efa61729e24bd65b1d152b5ab5409052aa80e65`, 17,916-row leak-filtered
+  DAPO-Math-17k split, Eq. 5 teacher-top-64 objective, batch 2,048 as 1,024
   prompts x 2 samples, 32,768-token cap, temperature 1.0 without sampling
   truncation, LR `1e-6`, 25 updates, and BF16 only.
 - The recovery uses one teacher node because the two original teacher nodes
   averaged only about 33% wall-clock GPU utilization each. One node reduces
   allocation/preemption exposure while retaining the same TP4 server and
   projects to roughly 67% combined wall-clock utilization.
-- Trainer checkpoints now include optimizer, scheduler, progress, and
-  dataloader state every five steps (`weights_only = false`) in addition to HF
-  weight exports. The persistent evaluator watches stable steps 5/10/15/20/25
-  and submits serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs.
-- Startup completed cleanly: all 40/40 BF16, unquantized student inference
-  replicas became ready, the full-state trainer initialized from step 0, and
-  the first 2,048-sample rollout entered steady state with all 40 generation
-  GPUs at approximately 99% utilization. Trainer and teacher GPUs are idle in
-  this generation phase by design; they become active during the subsequent
-  teacher-scoring and optimizer-update phases.
+- Steps 0 through 4 completed cleanly with 2,048/2,048 trainable sequences per
+  update, zero rollout errors, and maximum policy lag 1. During their active
+  phases, all 40 generation replicas ran at approximately 99% GPU utilization,
+  trainer throughput was approximately 45--46.6K token/s, and the teacher ran
+  at approximately 95--99% GPU utilization.
+- At step 4, corrected Eq. 5 divergence was `0.1874304414`, sampled reverse KL
+  was `0.1882639974`, and student entropy was `0.2615351081`; training remains
+  numerically healthy.
+- The step 5 full-state checkpoint is durable: its DCP payload is 171 GiB and
+  indexes 2,340 keys spanning model, optimizer, scheduler, and progress state.
+  The matching HF export has a `STABLE` marker. This confirms that the fresh
+  run can be resumed exactly, unlike the interrupted weights-only run.
+- The persistent evaluator watches stable steps 5/10/15/20/25 and submits
+  serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs. Step 5 evaluation is
+  running as Slurm `2827011`.
 
 ## Matched Base-student control
 
