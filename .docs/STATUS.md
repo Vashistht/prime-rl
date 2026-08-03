@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-03 00:12 PDT.
+Last updated: 2026-08-03 01:27 PDT.
 
 ## Code
 
@@ -111,6 +111,18 @@ Last updated: 2026-08-03 00:12 PDT.
   (174/240), AIME26 `77.08%` (185/240), and GPQA-Diamond `63.89%`
   (1,012/1,584). Relative to the matched baseline (`73.75%`, `74.58%`, and
   `62.94%`), the checkpoint is mixed/approximately flat rather than collapsed.
+- Step 10 is also fully durable: the 171 GiB DCP contains the same 2,340-key
+  model/optimizer/scheduler/progress structure as step 5, and its 13-shard HF
+  export is marked `STABLE`. Its saved progress is 20,480 samples from 10,240
+  source prompts and 213,570,652 tokens.
+- Step 10 evaluation Slurm `2827719` completed with exit 0 and zero runtime
+  errors: AIME25 `71.25%` (171/240), AIME26 `75.00%` (180/240), and
+  GPQA-Diamond `63.26%` (1,002/1,584). These remain approximately flat against
+  both baseline and step 5; there is no failure-mode collapse through step 10.
+- From the first update to checkpoint 10, corrected Eq. 5 divergence moved
+  from `0.188573` to `0.182438`, sampled reverse KL from `0.188920` to
+  `0.183279`, and entropy from `0.260466` to `0.265652`. The sampled token was
+  inside the teacher top 64 for `99.9866%` of tokens at checkpoint 10.
 
 ## Queued matched post-trained old-data control
 
