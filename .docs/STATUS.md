@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-03 01:27 PDT.
+Last updated: 2026-08-03 01:39 PDT.
 
 ## Code
 
@@ -88,8 +88,7 @@ Last updated: 2026-08-03 01:27 PDT.
   truncation, LR `1e-6`, 25 updates, and BF16 only.
 - The recovery uses one teacher node because the two original teacher nodes
   averaged only about 33% wall-clock GPU utilization each. One node reduces
-  allocation/preemption exposure while retaining the same TP4 server and
-  projects to roughly 67% combined wall-clock utilization.
+  allocation/preemption exposure while retaining the same TP4 server.
 - Steps 0 through 4 completed cleanly with 2,048/2,048 trainable sequences per
   update, zero rollout errors, and maximum policy lag 1. During their active
   phases, all 40 generation replicas ran at approximately 99% GPU utilization,
@@ -123,6 +122,14 @@ Last updated: 2026-08-03 01:27 PDT.
   from `0.188573` to `0.182438`, sampled reverse KL from `0.188920` to
   `0.183279`, and entropy from `0.260466` to `0.265652`. The sampled token was
   inside the teacher top 64 for `99.9866%` of tokens at checkpoint 10.
+- A five-second-sample utilization audit across 11 complete steady-state
+  intervals measured `56.32%` GPU-time-weighted utilization across all 52
+  GPUs. Student generation, trainer, and teacher roles averaged `59.26%`,
+  `43.61%`, and `52.26%` wall-clock utilization, respectively, but each ran at
+  `96.7--98.5%` when active and no individual node lagged its peers. The
+  remaining idle time is synchronized pipeline waiting: the single TP4 235B
+  teacher is now the critical path for about 35% of steady-state wall time.
+  Adding more student-generation nodes alone would not improve throughput.
 
 ## Queued matched post-trained old-data control
 
