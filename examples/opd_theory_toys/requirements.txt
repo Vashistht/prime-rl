@@ -1,0 +1,5 @@
+# PyTorch and Prime-RL dependencies come from the existing Prime-RL runtime.
+matplotlib>=3.9
+nbclient>=0.10
+nbformat>=5.10
+numpy>=2.0

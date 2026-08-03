@@ -1,0 +1,3 @@
+# The repository ignores notebooks globally.  This executed notebook is the
+# primary artifact for this experiment and is intentionally versionable.
+!opd_toy_study.ipynb
