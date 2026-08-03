@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 17:14 PDT.
+Last updated: 2026-08-02 17:56 PDT.
 
 ## Code
 
@@ -21,8 +21,11 @@ Last updated: 2026-08-02 17:14 PDT.
 - W&B: <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/a49312a48fa144d7b019f25e14d6d437>
 - Checkpoint evaluator: watches steps 5/10/15/20/25 and submits serial
   AIME25/AIME26/GPQA-Diamond avg@8 jobs.
-- Current state at this update: both teacher and Prime-RL jobs running; all
-  student and teacher endpoints ready; rollout batch zero generating.
+- Current state at this update: both teacher and Prime-RL jobs are running;
+  optimizer steps 0 and 1 completed without errors. At step 0, the corrected
+  token-weighted teacher/student divergence was `0.18837`, sampled reverse KL
+  was `0.18874`, and student entropy was `0.25959`. This independently matches
+  the paper's reported external-teacher initial KL of approximately `0.19`.
 
 ## Matched Base-student control
 
@@ -33,9 +36,19 @@ Requested comparison:
   identical to the active run;
 - data: the older complete 16,818-row local math/STEM view.
 
-The Base snapshot is being staged and verified. This control has not yet been
-submitted; it must not be pointed at the post-trained 30B snapshot as a
-fallback.
+- Exact Base snapshot:
+  `1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9` (16/16 shards and all 18,867
+  indexed tensors verified).
+- Base baseline eval: Slurm `2825618`, AIME25/AIME26/GPQA-Diamond avg@8.
+- Replacement teacher service: Slurm `2825629`, two TP4 nodes, live compact
+  top-64 probes passed. The initial `2825619` allocation was intentionally
+  cancelled before RL submission solely to extend walltime.
+- Prime-RL: Slurm `2825644`, 12 nodes, submitted and waiting for resources at
+  this update; scheduler estimate was 18:08 PDT.
+- Checkpoint evaluator: persistent watcher for steps 5/10/15/20/25, all three
+  benchmarks avg@8.
+- Safety walltime: 24 hours for RL and 26 hours for the teacher; all scientific
+  settings remain matched and BF16-only.
 
 ## Prior control
 

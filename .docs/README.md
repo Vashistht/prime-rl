@@ -103,6 +103,17 @@ This local dataset reaches its epoch boundary after about 17.5 steps at this
 batch size, so steps 18-25 contain reshuffled repeated prompts. Record that
 when interpreting any instability near the paper's reported step-18 collapse.
 
+The matched Base-student control uses the complete older 16,818-row local
+math/STEM view and the immutable `Qwen3-30B-A3B-Base` revision
+`1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9`. Its native tokenizer has the
+same core BPE, 151,669 tokenizer entries, and renderer token IDs as the
+post-trained student. Its EOS metadata is 151643 instead of 151645; Prime's
+Qwen3 renderer and the eval launcher explicitly stop on both IDs. The Base
+arm otherwise keeps the teacher, Eq. 5 loss, batch, LR, lengths, precision,
+topology, and evaluation protocol fixed. Request 24 hours for RL and 26 hours
+for its teacher service because a raw Base model can hit the 32K cap much more
+often; walltime is operational and does not alter the experiment.
+
 Before launching on another cluster, run the focused preflight inside the
 target container:
 
