@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 23:44 PDT.
+Last updated: 2026-08-03 00:01 PDT.
 
 ## Code
 
@@ -106,10 +106,11 @@ Last updated: 2026-08-02 23:44 PDT.
   zero errors, maximum policy lag 1, `0.8%` truncation, entropy `0.2668`, and
   approximately 46.1K token/s (`14.6%` reported MFU).
 - The persistent evaluator watches stable steps 5/10/15/20/25 and submits
-  serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs. Step 5 evaluation is
-  running as Slurm `2827011`: AIME25 completed at `72.50%` (174/240) and
-  AIME26 at `77.08%` (185/240), both with zero runtime errors; GPQA-Diamond is
-  in progress.
+  serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs. Step 5 evaluation Slurm
+  `2827011` completed with exit 0 and zero runtime errors: AIME25 `72.50%`
+  (174/240), AIME26 `77.08%` (185/240), and GPQA-Diamond `63.89%`
+  (1,012/1,584). Relative to the matched baseline (`73.75%`, `74.58%`, and
+  `62.94%`), the checkpoint is mixed/approximately flat rather than collapsed.
 
 ## Queued matched post-trained old-data control
 
