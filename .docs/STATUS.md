@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 18:40 PDT.
+Last updated: 2026-08-02 19:22 PDT.
 
 ## Code
 
@@ -27,13 +27,20 @@ Last updated: 2026-08-02 18:40 PDT.
   `0.18837`, sampled reverse KL was `0.18874`, and student entropy was
   `0.25959`. This independently matches the paper's reported external-teacher
   initial KL of approximately `0.19`.
-- Step 5 checkpoint: stable at 18:27 PDT; checkpoint eval Slurm `2825729` is
-  running. Its completed AIME25 avg@8 result is `76.25%` (183/240) with zero
-  errors; AIME26 and GPQA-Diamond remain in progress.
+- Step 5 checkpoint: stable at 18:27 PDT. Checkpoint eval Slurm `2825729`
+  completed successfully with zero request/runtime errors: AIME25 `76.25%`
+  (183/240), AIME26 `70.83%` (170/240), and GPQA-Diamond `62.50%`
+  (990/1,584). The matching student baseline was `73.75%`, `74.58%`, and
+  `62.94%`, respectively, so step 5 is mixed/approximately flat rather than
+  collapsed.
 - Step 5 training health: 2,048/2,048 sequences trainable, zero rollout
   errors, max policy lag 1. A small `1.03%` tail (21/2,048) reached the paper's
   32,768-token cap; mean total/decode lengths were 10,643/10,526, so responses
   are not piling up at the cap.
+- Step 5 eval length audit: 19/240 AIME25 and 17/240 AIME26 samples reached
+  the paper-matched 32,768-token cap; GPQA-Diamond had no truncations. The
+  complete evaluator allocation averaged `90.3%` GPU utilization including
+  startup/shutdown and `97.4%` over active samples.
 
 ## Matched Base-student control
 
@@ -52,17 +59,26 @@ Requested comparison:
 - Replacement teacher service: Slurm `2825629`, two TP4 nodes, live compact
   top-64 probes passed. The initial `2825619` allocation was intentionally
   cancelled before RL submission solely to extend walltime.
-- Prime-RL: Slurm `2825644`, running on 12 nodes.
+- Prime-RL: Slurm `2825644`, completed successfully through step 25 in 43:09;
+  all five requested checkpoints are stable.
 - W&B:
   <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/3c07cdf8cc0b4081b5fdcce5b3dca07e>
 - Checkpoint evaluator: persistent watcher for steps 5/10/15/20/25, all three
   benchmarks avg@8.
-- Stable checkpoints at this update: steps 5, 10, and 15. Step 5 eval Slurm
-  `2825705` completed successfully; step 10 eval `2825730` is running and step
-  15 eval `2825738` is serialized behind it.
-- Step 5 avg@8 results (zero errors): AIME25 `4.17%`, AIME26 `6.67%`,
-  GPQA-Diamond `19.19%`. Relative to the baseline above, there is no early
-  improvement; these small deltas remain within avg@8 sampling noise.
+- All checkpoint evals completed successfully with zero runtime errors:
+
+  | Checkpoint | AIME25 | AIME26 | GPQA-Diamond |
+  | --- | ---: | ---: | ---: |
+  | Baseline | 4.58% | 6.67% | 19.95% |
+  | Step 5 | 4.17% | 6.67% | 19.19% |
+  | Step 10 | 3.75% | 4.17% | 18.62% |
+  | Step 15 | 3.33% | 4.58% | 18.69% |
+  | Step 20 | 5.00% | 3.33% | 19.32% |
+  | Step 25 | 2.92% | 5.00% | 18.94% |
+
+  The Base control degrades overall but does not exhibit a numerical crash.
+- The Base teacher service `2825629` was released immediately after training;
+  checkpoint evaluation uses only the saved student weights.
 - Safety walltime: 24 hours for RL and 26 hours for the teacher; all scientific
   settings remain matched and BF16-only.
 
