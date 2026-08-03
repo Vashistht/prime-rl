@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 18:10 PDT.
+Last updated: 2026-08-02 18:40 PDT.
 
 ## Code
 
@@ -22,10 +22,18 @@ Last updated: 2026-08-02 18:10 PDT.
 - Checkpoint evaluator: watches steps 5/10/15/20/25 and submits serial
   AIME25/AIME26/GPQA-Diamond avg@8 jobs.
 - Current state at this update: both teacher and Prime-RL jobs are running;
-  optimizer steps 0 and 1 completed without errors. At step 0, the corrected
-  token-weighted teacher/student divergence was `0.18837`, sampled reverse KL
-  was `0.18874`, and student entropy was `0.25959`. This independently matches
-  the paper's reported external-teacher initial KL of approximately `0.19`.
+  optimizer updates through policy version 6 completed without errors. At
+  step 0, the corrected token-weighted teacher/student divergence was
+  `0.18837`, sampled reverse KL was `0.18874`, and student entropy was
+  `0.25959`. This independently matches the paper's reported external-teacher
+  initial KL of approximately `0.19`.
+- Step 5 checkpoint: stable at 18:27 PDT; checkpoint eval Slurm `2825729` is
+  running. Its completed AIME25 avg@8 result is `76.25%` (183/240) with zero
+  errors; AIME26 and GPQA-Diamond remain in progress.
+- Step 5 training health: 2,048/2,048 sequences trainable, zero rollout
+  errors, max policy lag 1. A small `1.03%` tail (21/2,048) reached the paper's
+  32,768-token cap; mean total/decode lengths were 10,643/10,526, so responses
+  are not piling up at the cap.
 
 ## Matched Base-student control
 
@@ -49,6 +57,12 @@ Requested comparison:
   <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/3c07cdf8cc0b4081b5fdcce5b3dca07e>
 - Checkpoint evaluator: persistent watcher for steps 5/10/15/20/25, all three
   benchmarks avg@8.
+- Stable checkpoints at this update: steps 5, 10, and 15. Step 5 eval Slurm
+  `2825705` completed successfully; step 10 eval `2825730` is running and step
+  15 eval `2825738` is serialized behind it.
+- Step 5 avg@8 results (zero errors): AIME25 `4.17%`, AIME26 `6.67%`,
+  GPQA-Diamond `19.19%`. Relative to the baseline above, there is no early
+  improvement; these small deltas remain within avg@8 sampling noise.
 - Safety walltime: 24 hours for RL and 26 hours for the teacher; all scientific
   settings remain matched and BF16-only.
 
