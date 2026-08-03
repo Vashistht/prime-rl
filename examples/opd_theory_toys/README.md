@@ -1,5 +1,15 @@
 # SFT vs OPD vs RL: theory-first toy experiments
 
+**Phase 2 lives in `opd_selector_study.ipynb`** (source:
+`opd_selector_study.py`, built via
+`uv run python run_notebook.py opd_selector_study`).  `opd_toy_study.ipynb`
+is frozen as the mechanism atlas.  Phase 2 preregisters a three-headed
+method selector and six falsifiers (`PREREGISTRATION.md`), then runs them:
+unlocking rates (`unlocking_experiments.py`), the frozen-rollout
+semigradient sign flip (`semigradient_experiments.py`), the depth-H
+two-track process (`depth_h_experiments.py`), and the first held-out
+selection-regret benchmark (`selector_benchmark.py`).
+
 This directory is a small, CPU-friendly, first-principles study.  It is
 intentionally not a new Prime-RL environment.  The organizing object is an
 explicit desired/evaluation distribution `p_star`, kept separate from the
