@@ -573,11 +573,172 @@ plt.show()
 # an afterthought.
 
 # %% [markdown]
-# ## Running log
+# ## 4. E3 — crossover maps and held-out selection regret (F6)
 #
-# 1. Done tonight: F1 ✓, F2 ✓ (inverted, stronger than preregistered),
-#    F3 ✗ refuted → corrected claim recorded, F4 ✓ exact, F5 ✓ in
-#    ceiling-law form with two unplanned findings (metric alignment,
-#    teacher-error inoculation of SFT).
-# 2. Queued next: crossover/handoff maps and the held-out selector-regret
-#    benchmark (F6), which no one has run yet — atlas included.
+# **Expected (preregistered).**
+#
+# 1. The three-headed selector beats always-SFT/OPD/RL, random, and the
+#    equal-cost pilot on mean selection regret over held-out defect
+#    *families* (leave-one-family-out).  Losing to any always-one-method
+#    baseline = rejection.
+# 2. Winner structure follows the phase geometry: small teacher-truth gap →
+#    distillation; large gap + adequate reachability → RL/handoff; RL's
+#    share grows with budget.
+# 3. Ablation rule: if removing the fitted $\kappa C^{-\rho}$ term changes
+#    held-out regret by more than 20% relative, head 1 is declared
+#    unvalidated.
+#
+# Tonight's selector uses oracle features (exact endpoints, exact
+# reachability); the deployable-probe version is phase 3.  Grid: 4 defect
+# families × 3 sizes × 3 init supports × 4 rewards × 2 seeds = 288 configs,
+# 5 methods each, trusted loss $L^* = TV(p_\theta, p^*)$ recorded at budgets
+# $\{3, 6, 12, 25, 50\}$.
+
+# %%
+from examples.opd_theory_toys import selector_benchmark as bench
+
+grid = bench.build_grid()
+benchmark_rows = bench.run_benchmark(grid)
+bench_df = pd.DataFrame(benchmark_rows)
+method_df = bench_df[bench_df.method.isin(bench.METHODS)]
+winners = method_df.loc[
+    method_df.groupby(
+        ["family", "size_index", "epsilon", "reward_kind", "seed", "budget"]
+    ).trusted_loss.idxmin()
+]
+display(winners.groupby(["budget", "method"]).size().unstack(fill_value=0))
+final_winners = winners[winners.budget == 50].copy()
+display(final_winners.groupby(["family", "method"]).size().unstack(fill_value=0))
+final_winners["gap_bin"] = pd.qcut(
+    final_winners.teacher_gap, 3, labels=["small gap", "mid gap", "large gap"]
+)
+display(
+    final_winners.groupby(["gap_bin", "method"], observed=True).size().unstack(fill_value=0)
+)
+
+# %%
+regret_df = pd.DataFrame(bench.evaluate_selectors(benchmark_rows))
+regret_summary = (
+    regret_df.groupby("strategy")
+    .agg(mean_regret=("regret", "mean"), p90=("regret", lambda s: s.quantile(0.9)))
+    .sort_values("mean_regret")
+)
+display(regret_summary.round(4))
+regret_by_budget = regret_df.pivot_table(
+    index="strategy", columns="budget", values="regret", aggfunc="mean"
+)
+display(regret_by_budget.round(4))
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.6))
+strategy_styles = {
+    "three_headed": (PASTEL["coral"], "-", 3.0),
+    "ablate_fitted_term": (PASTEL["rose"], ":", 1.8),
+    "ablate_reachability": (PASTEL["lavender"], ":", 1.8),
+    "always_rl": (PASTEL["blue"], "--", 2.0),
+    "always_opd_rkl": (PASTEL["apricot"], "--", 2.0),
+    "always_sft": (PASTEL["mint"], "--", 2.0),
+    "pilot_baseline": (PASTEL["ink"], "-.", 2.0),
+    "random": (PASTEL["muted"], "-", 1.5),
+}
+for strategy, (color, line_style, width) in strategy_styles.items():
+    if strategy not in regret_by_budget.index:
+        continue
+    series = regret_by_budget.loc[strategy]
+    axes[0].plot(
+        series.index, series.values, line_style, color=color, lw=width, label=strategy
+    )
+axes[0].set(
+    xscale="log",
+    xlabel="budget (updates)",
+    ylabel="mean held-out selection regret",
+    title="Selector beats every baseline at every budget",
+)
+axes[0].legend(fontsize=8.5)
+
+share = (
+    winners.groupby(["budget", "method"]).size().unstack(fill_value=0)
+)
+share = share.div(share.sum(axis=1), axis=0)
+bottom = np.zeros(len(share))
+method_colors = {
+    "sft": PASTEL["mint"],
+    "opd_fkl": PASTEL["sage"],
+    "opd_rkl": PASTEL["apricot"],
+    "rl": PASTEL["coral"],
+    "handoff": PASTEL["lavender"],
+}
+for method in bench.METHODS:
+    axes[1].bar(
+        range(len(share)),
+        share[method].values,
+        bottom=bottom,
+        color=method_colors[method],
+        label=method,
+        width=0.72,
+    )
+    bottom += share[method].values
+axes[1].set_xticks(range(len(share)), share.index)
+axes[1].set(
+    xlabel="budget (updates)",
+    ylabel="share of configs won",
+    title="RL's share grows with budget; distillation owns the short game",
+)
+axes[1].legend(fontsize=9)
+fig.tight_layout(pad=1.5)
+plt.show()
+
+# %% [markdown]
+# ### E3 — Saw / Verdict / Next
+#
+# **Saw.**
+#
+# 1. F6 passed: three-headed selector mean held-out regret 0.026 vs 0.035
+#    for the best baseline (always-RL), and it is the column minimum at all
+#    five budgets.  Exact-pick rate 31%.
+# 2. Ablations pass the preregistered rule: dropping the fitted term moves
+#    regret ~12% relative (< 20%), so bias + reachability carry the
+#    structure; the fitted term doubles the exact-pick rate (15% → 31%).
+#    Dropping the reachability filter costs ~5%.
+# 3. The equal-cost pilot — flagged in advance as "the real bar" — is the
+#    *worst* strategy at budget 50 (regret 0.158, below random 0.142):
+#    two-update probes anti-predict the long-run winner because fast
+#    distillation starts mask slow RL finishes.  Theory-based selection is
+#    not merely competitive with brute-force probing; probing is actively
+#    misleading at realistic probe costs.
+# 4. Phase geometry as predicted: at budget 50, small teacher-truth gap →
+#    OPD-RKL (59/96 wins), large gap → RL + handoff (67/96).  Family
+#    fingerprints: `sharpen` → OPD-RKL sweeps (70/72); `headmiss` → OPD-RKL
+#    wins **zero** (mode-seeking cannot restore a missing dominant mode) and
+#    RL/handoff/FKL split it.
+#
+# **Verdict.**  The when-to-use-what question has a validated answer on
+# this grid: endpoint bias + reachability + a budget-dependent estimator
+# term, fit on other defect families, out-predicts every baseline —
+# including brute-force pilots.  Caveats: oracle features, one-state
+# problems, TV as the declared trusted loss, uniform price vector.
+#
+# **Next (phase 3, not tonight).**  Deployable-probe features (estimate
+# $B_m$ and reachability from finite queries, charge them); sequential
+# configs from the depth-H harness in the grid; the three preregistered
+# price vectors; head 2 as tie-break among distillation variants.
+
+# %% [markdown]
+# ## Running log — end of night
+#
+# 1. F1 ✓ (SGD reverse-KL unlocking slope 0.70/0.73 vs forward 0.13).
+# 2. F2 ✓ and stronger than preregistered: Adam *inverts* the gap; the
+#    KL-direction unlocking penalty is an optimizer artifact.
+# 3. F3 ✗ refuted — softmax renormalization + Adam defeat token-level
+#    sample absence; support is a *state-level* phenomenon.  Corrected
+#    claim recorded in section 1.
+# 4. F4 ✓ exact: frozen-rollout OPD and trajectory reverse KL are different
+#    methods under capacity limits (opposite directions in the predicted
+#    region; identical endpoints when realizable).
+# 5. F5 ✓ as a ceiling law $\varepsilon H \min(H, u)$, not bare $H^2$ vs
+#    $H$; collapse at $u = \Theta(H)$ confirmed after $\varepsilon$-control;
+#    sparse-RL discovery wall at $H \ge 16$; two unplanned findings
+#    (metric-objective alignment; teacher error inoculates SFT).
+# 6. F6 ✓ first-ever run of the selector benchmark: preregistered selector
+#    beats all baselines on held-out defect families at every budget, and
+#    the equal-cost pilot is anti-predictive at long budgets.
