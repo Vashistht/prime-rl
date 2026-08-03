@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-03 00:01 PDT.
+Last updated: 2026-08-03 00:12 PDT.
 
 ## Code
 
@@ -142,9 +142,14 @@ Last updated: 2026-08-03 00:01 PDT.
 Requested comparison:
 
 - student: `Qwen/Qwen3-30B-A3B-Base`;
-- teacher, Eq. 5 objective, hyperparameters, topology, and evaluation protocol:
+- teacher, Eq. 5 objective, scientific hyperparameters, and evaluation protocol:
   identical to the active run;
 - data: the older complete 16,818-row local math/STEM view.
+
+The Base allocation used two identical TP4 teacher-serving replicas rather
+than one and saved weights-only checkpoints rather than full optimizer state.
+Those are throughput/recovery differences only; they do not alter teacher
+scores, the loss, gradients, or checkpoint evaluation.
 
 - Exact Base snapshot:
   `1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9` (16/16 shards and all 18,867

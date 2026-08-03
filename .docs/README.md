@@ -111,9 +111,12 @@ same core BPE, 151,669 tokenizer entries, and renderer token IDs as the
 post-trained student. Its EOS metadata is 151643 instead of 151645; Prime's
 Qwen3 renderer and the eval launcher explicitly stop on both IDs. The Base
 arm otherwise keeps the teacher, Eq. 5 loss, batch, LR, lengths, precision,
-topology, and evaluation protocol fixed. Request 24 hours for RL and 26 hours
-for its teacher service because a raw Base model can hit the 32K cap much more
-often; walltime is operational and does not alter the experiment.
+and evaluation protocol fixed. Its completed allocation used two identical
+TP4 teacher-serving replicas instead of one and weights-only rather than
+full-state checkpoints; these affect only serving throughput and recovery,
+not training math. Request 24 hours for RL and 26 hours for its teacher service
+because a raw Base model can hit the 32K cap much more often; walltime is
+operational and does not alter the experiment.
 
 Before launching on another cluster, run the focused preflight inside the
 target container:
