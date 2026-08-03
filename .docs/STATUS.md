@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-03 02:12 PDT.
+Last updated: 2026-08-03 02:43 PDT.
 
 ## Code
 
@@ -154,13 +154,23 @@ Last updated: 2026-08-03 02:12 PDT.
   `recovery_archive/pre_resume_step10_20260803`; the complete step-10 trainer,
   orchestrator, and HF checkpoints were preserved and their metadata hashes
   reverified after rendering.
-- Continuation teacher Slurm `2828255` is queued for two independent TP4
-  replicas. Once both compact top-64 live probes pass, the launcher will submit
-  a fresh 12-node Prime-RL job with `resume_step=10`, absolute
-  `max_steps=25`, a new W&B identity, and otherwise identical scientific
-  settings. Both generated jobs have `--no-requeue`. Two teacher replicas are
-  an operational throughput/reliability change only and should fit the 15
-  remaining updates inside the QOS protection window.
+- Continuation teacher Slurm `2828255` allocated two independent TP4 replicas;
+  both loaded the exact teacher and passed the compact top-64 live probe. It
+  then submitted the fresh 12-node Prime-RL continuation as Slurm `2828367`
+  with `resume_step=10`, absolute `max_steps=25`, a new W&B identity, and
+  otherwise identical scientific settings. Both jobs had `--no-requeue`.
+- The scheduler initially forecast that `2828367` would wait until after the
+  already-running teachers' 4:05 preemption protection expired. Rather than
+  hold eight idle GPUs and knowingly repeat the infrastructure failure,
+  teacher `2828255` was intentionally cancelled after validation and its logs
+  and GPU traces were archived under
+  `recovery_archive/retimed_teacher_2828255`.
+- Fresh identical teacher job `2828539` has a delayed begin time of 05:15 PDT.
+  Prime-RL `2828367` has a verified `after:2828539+15` dependency, so it cannot
+  start until the replacement service has had 15 minutes to load. The teacher
+  URLs will be rebound to the new two hosts before that dependency releases.
+  This aligns the teacher protection window with the 12-node training
+  allocation; it changes scheduling only, not the frozen teacher or loss.
 
 ## Queued matched post-trained old-data control
 
@@ -176,10 +186,9 @@ Last updated: 2026-08-03 02:12 PDT.
   `mopd_eq5`, teacher top-64, batch 2,048 as 1,024 prompts x 2 samples, LR
   `1e-6`, 32,768 tokens, 25 updates, and resumable full-state checkpoints at
   steps 5/10/15/20/25.
-- CPU-only launch coordinator Slurm `2827170` is held by the user and consumes
-  no GPU. After the continuation RL job is published, its dependency will be
-  set to that new job before the hold is released, so it cannot overlap the
-  DAPO training allocation. It then provisions and live-validates two fresh
+- CPU-only launch coordinator Slurm `2827170` consumes no GPU and now has the
+  verified dependency `afterany:2828367`; it cannot overlap the DAPO training
+  allocation. It then provisions and live-validates two fresh
   TP4 teacher-serving replicas before submitting the matched 12-node Prime-RL
   job. It does not reuse the current fixed teacher endpoints; the second
   identical replica keeps the full 25-step job inside the QOS protection
