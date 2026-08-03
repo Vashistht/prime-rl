@@ -57,3 +57,31 @@ class TrainSource:
         example = rows[cursor]
         self.cursors[env_name] = cursor + 1
         return example
+
+    def fast_forward(self, num_examples: int) -> None:
+        """Advance a legacy single-env source without dispatching examples.
+
+        ``Progress.total_problems`` counts one entry for every training group
+        shipped before a checkpoint. For a single env, replaying that many
+        selections restores its deterministic shuffle and cursor on resume.
+
+        Aggregate progress is insufficient for multiple envs: permit misses
+        consume env-choice RNG draws without incrementing ``total_problems``.
+        Refuse that ambiguous case instead of silently restoring the wrong
+        per-env positions.
+        """
+        if num_examples < 0:
+            raise ValueError(f"num_examples must be non-negative, got {num_examples}")
+        if len(self.env_names) != 1:
+            raise ValueError(
+                "Cannot restore a multi-environment TrainSource from aggregate total_problems; "
+                "a checkpoint with per-environment source state is required"
+            )
+
+        # During replay there is no live dispatcher, so make the configured
+        # env eligible regardless of its group-scoring permit cost.
+        available_permits = max(self.env_costs.values())
+        for _ in range(num_examples):
+            example = self.next_example(available_permits)
+            if example is None:  # defensive: all env costs fit above
+                raise RuntimeError("TrainSource replay unexpectedly failed to select an example")

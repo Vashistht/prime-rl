@@ -360,6 +360,11 @@ class Orchestrator:
             use_cache_salt = True
 
         self.train_source = TrainSource(self.train_envs, seed=42)
+        if self.resume_step is not None and self.progress.total_problems > 0:
+            self.train_source.fast_forward(self.progress.total_problems)
+            get_logger().info(
+                f"Restored training-data position after {self.progress.total_problems} previously shipped problem(s)"
+            )
         self.eval_source: EvalSource | None = (
             EvalSource(
                 self.eval_envs,
