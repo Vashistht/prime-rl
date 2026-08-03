@@ -95,8 +95,9 @@ The current DAPO arm uses:
 - 25 optimizer steps, LR `1e-6`, max sequence/completion length 32,768;
 - temperature 1.0, no top-p or top-k sampling truncation;
 - 10 inference nodes (40 TP1 replicas), two trainer nodes (DP replicate 2,
-  EP4), and two TP4 teacher nodes;
-- checkpoint weights at steps 5, 10, 15, 20, and 25;
+  EP4), and one TP4 teacher node;
+- full trainer-state checkpoints plus HF evaluation weights at steps 5, 10,
+  15, 20, and 25;
 - AIME25, AIME26, and GPQA-Diamond checkpoint evaluation at avg@8.
 
 This local dataset reaches its epoch boundary after about 17.5 steps at this

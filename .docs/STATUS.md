@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 21:40 PDT.
+Last updated: 2026-08-02 21:46 PDT.
 
 ## Code
 
@@ -72,7 +72,9 @@ Last updated: 2026-08-02 21:40 PDT.
 - Teacher: Slurm `2826432`, one TP4 node. The compact live preflight passed
   with HTTP 200 and validated teacher-top-64 token/log-prob tensor shapes.
 - Prime-RL: Slurm `2826440`, 12 nodes (10 generation, 2 trainer), submitted
-  after the live teacher gate; queued for resources at this update.
+  after the live teacher gate and running since 21:40 PDT.
+- W&B:
+  <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/cab787732c794f52bf13126cf9691dfe>
 - Scientific settings are unchanged from the original run: exact student and
   teacher snapshots, DAPO split, Eq. 5 top-64 objective, batch 2,048 as 1,024
   prompts x 2 samples, 32,768-token cap, temperature 1.0 without sampling
@@ -85,6 +87,12 @@ Last updated: 2026-08-02 21:40 PDT.
   dataloader state every five steps (`weights_only = false`) in addition to HF
   weight exports. The persistent evaluator watches stable steps 5/10/15/20/25
   and submits serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs.
+- Startup completed cleanly: all 40/40 BF16, unquantized student inference
+  replicas became ready, the full-state trainer initialized from step 0, and
+  the first 2,048-sample rollout entered steady state with all 40 generation
+  GPUs at approximately 99% utilization. Trainer and teacher GPUs are idle in
+  this generation phase by design; they become active during the subsequent
+  teacher-scoring and optimizer-update phases.
 
 ## Matched Base-student control
 
