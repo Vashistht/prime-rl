@@ -8,9 +8,12 @@ from pathlib import Path
 import nbformat
 from nbclient import NotebookClient
 
+import sys
+
 HERE = Path(__file__).resolve().parent
-SOURCE = HERE / "opd_toy_study.py"
-NOTEBOOK = HERE / "opd_toy_study.ipynb"
+STEM = sys.argv[1] if len(sys.argv) > 1 else "opd_toy_study"
+SOURCE = HERE / f"{STEM}.py"
+NOTEBOOK = HERE / f"{STEM}.ipynb"
 
 
 def parse_percent_cells(source: str) -> list[dict[str, str]]:
@@ -72,7 +75,7 @@ def main() -> None:
     notebook = build_notebook()
     client = NotebookClient(
         notebook,
-        timeout=600,
+        timeout=1800,
         kernel_name="python3",
         resources={"metadata": {"path": str(HERE)}},
         allow_errors=False,
