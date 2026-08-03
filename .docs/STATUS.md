@@ -1,15 +1,21 @@
 # Experiment status
 
-Last updated: 2026-08-03 01:39 PDT.
+Last updated: 2026-08-03 02:12 PDT.
 
 ## Code
 
 - Branch: `exp/mopd-eq5-dapo-qwen`
 - Eq. 5 commit: `050e5bf33`
+- Single-environment data-position resume fix: `9282e69e3`
 - Remote: `Vashistht/prime-rl`
 - Focused pure-loss/config/sequence tests: 8 passed.
 - Container preflight, including fused sparse value and gradient parity:
   17 passed.
+- Data-position replay tests: 4 passed, including the exact DAPO
+  17,916-row/10,240-prompt checkpoint boundary. The wider host-side
+  orchestrator suite cannot collect on the login node because its installed
+  FlashAttention CUDA extension cannot be mapped there; formatting, lint, and
+  Python compilation pass.
 
 ## Original DAPO Eq. 5 run (operationally interrupted)
 
@@ -65,18 +71,17 @@ Last updated: 2026-08-03 01:39 PDT.
 - This run saved HF weights only. Stable steps 5, 10, and 15 are valid, but no
   optimizer/scheduler state exists, so an exact continuation is impossible.
 
-## Active clean DAPO recovery run
+## DAPO full-state recovery run and step-10 continuation
 
 - Run name:
   `table4-qwen30b-original235b-mopd-eq5-topk64-dapo17k-b2048-g2-rerun1-20260802`.
 - This is a fresh run after the original job's teacher-service preemption. The
   original interruption was infrastructural, not a scientific collapse; this
   recovery is configured with resumable full-state checkpoints.
-- Teacher: Slurm `2826432`, one TP4 node. The compact live preflight passed
+- Initial teacher: Slurm `2826432`, one TP4 node. The compact live preflight passed
   with HTTP 200 and validated teacher-top-64 token/log-prob tensor shapes.
-- Prime-RL: Slurm `2826440`, 12 nodes (10 generation, 2 trainer), submitted
-  after the live teacher gate and running since 21:40 PDT.
-- W&B:
+- Initial Prime-RL segment: Slurm `2826440`, 12 nodes (10 generation, 2
+  trainer), submitted after the live teacher gate. W&B:
   <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/cab787732c794f52bf13126cf9691dfe>
 - Scientific settings are unchanged from the original run: student
   `Qwen/Qwen3-30B-A3B` at
@@ -86,9 +91,10 @@ Last updated: 2026-08-03 01:39 PDT.
   DAPO-Math-17k split, Eq. 5 teacher-top-64 objective, batch 2,048 as 1,024
   prompts x 2 samples, 32,768-token cap, temperature 1.0 without sampling
   truncation, LR `1e-6`, 25 updates, and BF16 only.
-- The recovery uses one teacher node because the two original teacher nodes
-  averaged only about 33% wall-clock GPU utilization each. One node reduces
-  allocation/preemption exposure while retaining the same TP4 server.
+- This segment used one teacher node to reduce the allocation, but the measured
+  steady-state audit showed that it became the critical path. More importantly,
+  the `normal` QOS protection expires after 4:05, making a one-teacher
+  continuation predictably too long for the protected window.
 - Steps 0 through 4 completed cleanly with 2,048/2,048 trainable sequences per
   update, zero rollout errors, and maximum policy lag 1. During their active
   phases, all 40 generation replicas ran at approximately 99% GPU utilization,
@@ -100,7 +106,8 @@ Last updated: 2026-08-03 01:39 PDT.
 - The step 5 full-state checkpoint is durable: its DCP payload is 171 GiB and
   indexes 2,340 keys spanning model, optimizer, scheduler, and progress state.
   The matching HF export has a `STABLE` marker. This confirms that the fresh
-  run can be resumed exactly, unlike the interrupted weights-only run.
+  model, optimizer, scheduler, and progress state can be restored, unlike the
+  interrupted weights-only run.
 - Trainer update 5 also completed cleanly: 2,048/2,048 trainable sequences,
   zero errors, maximum policy lag 1, `0.8%` truncation, entropy `0.2668`, and
   approximately 46.1K token/s (`14.6%` reported MFU).
@@ -130,6 +137,30 @@ Last updated: 2026-08-03 01:39 PDT.
   remaining idle time is synchronized pipeline waiting: the single TP4 235B
   teacher is now the critical path for about 35% of steady-state wall time.
   Adding more student-generation nodes alone would not improve throughput.
+- At 01:38:47 PDT, teacher `2826432` was preempted immediately after its QOS
+  exemption expired. The fixed endpoint disappeared, and Prime-RL `2826440`
+  failed with an API connection error at 01:41:15. Trainer updates 10--12 had
+  run, but only step 10 was a complete durable trainer/orchestrator/HF
+  checkpoint; the partial future trajectory is intentionally discarded. This
+  was an infrastructure failure, not model collapse.
+- Prime-RL's legacy checkpoint restored aggregate progress but reset
+  `TrainSource` to row zero. Commit `9282e69e3` fixes the single-environment
+  case by deterministically advancing the source by the checkpoint's 10,240
+  shipped prompts before dispatch. It refuses ambiguous multi-environment
+  resumes. This preserves first-epoch DAPO coverage instead of repeating the
+  first 10,240 prompts.
+- Stale step-10--13 rollout files, NCCL rendezvous markers, and the forced
+  step-13 orchestrator checkpoint were moved to
+  `recovery_archive/pre_resume_step10_20260803`; the complete step-10 trainer,
+  orchestrator, and HF checkpoints were preserved and their metadata hashes
+  reverified after rendering.
+- Continuation teacher Slurm `2828255` is queued for two independent TP4
+  replicas. Once both compact top-64 live probes pass, the launcher will submit
+  a fresh 12-node Prime-RL job with `resume_step=10`, absolute
+  `max_steps=25`, a new W&B identity, and otherwise identical scientific
+  settings. Both generated jobs have `--no-requeue`. Two teacher replicas are
+  an operational throughput/reliability change only and should fit the 15
+  remaining updates inside the QOS protection window.
 
 ## Queued matched post-trained old-data control
 
@@ -145,13 +176,17 @@ Last updated: 2026-08-03 01:39 PDT.
   `mopd_eq5`, teacher top-64, batch 2,048 as 1,024 prompts x 2 samples, LR
   `1e-6`, 32,768 tokens, 25 updates, and resumable full-state checkpoints at
   steps 5/10/15/20/25.
-- CPU-only launch coordinator Slurm `2827170` is pending on
-  `afterany:2826440`; therefore it consumes no GPU and cannot overlap the
-  current DAPO training allocation. Once released, it provisions and
-  live-validates a fresh one-node TP4 teacher before submitting the matched
-  12-node Prime-RL job. It does not reuse the current fixed teacher endpoint.
-- Future generated teacher jobs use Slurm `--no-requeue`: if preempted, they
-  now fail visibly instead of migrating hosts underneath fixed Prime-RL URLs.
+- CPU-only launch coordinator Slurm `2827170` is held by the user and consumes
+  no GPU. After the continuation RL job is published, its dependency will be
+  set to that new job before the hold is released, so it cannot overlap the
+  DAPO training allocation. It then provisions and live-validates two fresh
+  TP4 teacher-serving replicas before submitting the matched 12-node Prime-RL
+  job. It does not reuse the current fixed teacher endpoints; the second
+  identical replica keeps the full 25-step job inside the QOS protection
+  window.
+- Future generated teacher and Prime-RL jobs use Slurm `--no-requeue`: if
+  preempted, they now fail visibly instead of silently restarting against
+  stale fixed endpoints or replaying a checkpoint segment.
 - A persistent watcher is already waiting for the queued RL job id and will
   serialize AIME25/AIME26/GPQA-Diamond avg@8 evaluations for all five stable
   checkpoints.

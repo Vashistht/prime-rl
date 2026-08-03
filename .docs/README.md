@@ -95,7 +95,9 @@ The current DAPO arm uses:
 - 25 optimizer steps, LR `1e-6`, max sequence/completion length 32,768;
 - temperature 1.0, no top-p or top-k sampling truncation;
 - 10 inference nodes (40 TP1 replicas), two trainer nodes (DP replicate 2,
-  EP4), and one TP4 teacher node;
+  EP4), and one or two TP4 teacher-serving replicas. One replica is the
+  minimum allocation; two are used for the current step-10 continuation so
+  the remaining work fits inside the cluster's preemption-protection window;
 - full trainer-state checkpoints plus HF evaluation weights at steps 5, 10,
   15, 20, and 25;
 - AIME25, AIME26, and GPQA-Diamond checkpoint evaluation at avg@8.
@@ -103,6 +105,19 @@ The current DAPO arm uses:
 This local dataset reaches its epoch boundary after about 17.5 steps at this
 batch size, so steps 18-25 contain reshuffled repeated prompts. Record that
 when interpreting any instability near the paper's reported step-18 collapse.
+
+For a full-state resume on this legacy Prime-RL branch, set the same output
+directory and an explicit `ckpt.resume_step`, but use a new W&B run identity.
+Trainer, optimizer, scheduler, and aggregate orchestrator progress are loaded
+from that checkpoint. Commit `9282e69e3` also replays the deterministic
+single-environment source by `Progress.total_problems`, preventing a resume
+from restarting at row zero. It deliberately errors for multi-environment
+runs because aggregate progress cannot reconstruct their individual cursors;
+use a Prime-RL revision with first-class per-environment source checkpointing
+for those runs. Before restarting, archive rollout and NCCL broadcast folders
+at and after the resume step so stale batches and rendezvous markers cannot be
+consumed. Keep the full trainer/orchestrator checkpoint and HF eval weights at
+the resume step.
 
 The matched Base-student control uses the complete older 16,818-row local
 math/STEM view and the immutable `Qwen3-30B-A3B-Base` revision
