@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 17:56 PDT.
+Last updated: 2026-08-02 18:10 PDT.
 
 ## Code
 
@@ -39,12 +39,14 @@ Requested comparison:
 - Exact Base snapshot:
   `1b75feb79f60b8dc6c5bc769a898c206a1c6a4f9` (16/16 shards and all 18,867
   indexed tensors verified).
-- Base baseline eval: Slurm `2825618`, AIME25/AIME26/GPQA-Diamond avg@8.
+- Base baseline eval: Slurm `2825618`, completed with zero errors. Avg@8
+  results: AIME25 `4.58%`, AIME26 `6.67%`, GPQA-Diamond `19.95%`.
 - Replacement teacher service: Slurm `2825629`, two TP4 nodes, live compact
   top-64 probes passed. The initial `2825619` allocation was intentionally
   cancelled before RL submission solely to extend walltime.
-- Prime-RL: Slurm `2825644`, 12 nodes, submitted and waiting for resources at
-  this update; scheduler estimate was 18:08 PDT.
+- Prime-RL: Slurm `2825644`, running on 12 nodes.
+- W&B:
+  <https://wandb.ai/nvidia/opd_alignment-vashisth/runs/3c07cdf8cc0b4081b5fdcce5b3dca07e>
 - Checkpoint evaluator: persistent watcher for steps 5/10/15/20/25, all three
   benchmarks avg@8.
 - Safety walltime: 24 hours for RL and 26 hours for the teacher; all scientific
