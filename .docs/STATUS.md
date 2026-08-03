@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-03 02:43 PDT.
+Last updated: 2026-08-03 10:10 PDT.
 
 ## Code
 
@@ -165,12 +165,27 @@ Last updated: 2026-08-03 02:43 PDT.
   teacher `2828255` was intentionally cancelled after validation and its logs
   and GPU traces were archived under
   `recovery_archive/retimed_teacher_2828255`.
-- Fresh identical teacher job `2828539` has a delayed begin time of 05:15 PDT.
-  Prime-RL `2828367` has a verified `after:2828539+15` dependency, so it cannot
-  start until the replacement service has had 15 minutes to load. The teacher
-  URLs will be rebound to the new two hosts before that dependency releases.
-  This aligns the teacher protection window with the 12-node training
-  allocation; it changes scheduling only, not the frozen teacher or loss.
+- Subsequent replacement teachers were submitted with delayed begin times and
+  kept dependency-gated 15 minutes ahead of `2828367`. Scheduler forecasts
+  moved repeatedly as the provider drained the cluster. Every superseded
+  teacher was cancelled while still pending and therefore consumed zero GPU
+  time. No replacement teacher reached host publication, so the archived
+  endpoints were never rebound and the RL continuation never started.
+- At 09:43:32 PDT, the provider activated reservation
+  `cspu_cluster_return`, putting all 324 DFW GPU nodes into maintenance with
+  `IGNORE_JOBS`. At 10:03:20 Slurm system-cancelled the final pending teacher
+  `2831208` and Prime-RL `2828367` as `CANCELLED by 0`; both had zero runtime
+  and zero allocation. This was cluster retirement, not a model/training
+  failure. Step 10 remains the latest durable recovery point and steps 15/20/25
+  were not created.
+- The DAPO evaluator completed only steps 5 and 10 (`2827011`, `2827719`),
+  both with zero errors. Its persistent watcher was stopped after the parent
+  job became terminal so it would not restart-loop on the retired cluster.
+- DFW has no alternate GPU partition or account/QOS bypass. The documented
+  migration target is `aws-cmh-slurm-1` via `aws-cmh-login-01` or
+  `aws-cmh-login-02`. CMH is four-GPU-node ARM GB300/sm103, so the existing
+  CMH-native Prime image must be revalidated with a one-step smoke before the
+  step-10 DCP is resumed; the DFW GB200 image is not assumed ABI-portable.
 
 ## Queued matched post-trained old-data control
 
@@ -186,19 +201,19 @@ Last updated: 2026-08-03 02:43 PDT.
   `mopd_eq5`, teacher top-64, batch 2,048 as 1,024 prompts x 2 samples, LR
   `1e-6`, 32,768 tokens, 25 updates, and resumable full-state checkpoints at
   steps 5/10/15/20/25.
-- CPU-only launch coordinator Slurm `2827170` consumes no GPU and now has the
-  verified dependency `afterany:2828367`; it cannot overlap the DAPO training
-  allocation. It then provisions and live-validates two fresh
-  TP4 teacher-serving replicas before submitting the matched 12-node Prime-RL
-  job. It does not reuse the current fixed teacher endpoints; the second
-  identical replica keeps the full 25-step job inside the QOS protection
-  window.
+- CPU-only launch coordinator Slurm `2827170` had the verified dependency
+  `afterany:2828367`. The system cancellation released that dependency at
+  10:03:28. It rendered the matched configuration and submitted teacher
+  `2831552`, which Slurm immediately system-cancelled before allocation because
+  the nodes were reserved for maintenance. The launcher detected that the
+  teacher ended before readiness and deliberately withheld the fresh RL
+  submission. The coordinator exited after 53 seconds; no GPU was consumed
+  and no partial control training occurred.
 - Future generated teacher and Prime-RL jobs use Slurm `--no-requeue`: if
   preempted, they now fail visibly instead of silently restarting against
   stale fixed endpoints or replaying a checkpoint segment.
-- A persistent watcher is already waiting for the queued RL job id and will
-  serialize AIME25/AIME26/GPQA-Diamond avg@8 evaluations for all five stable
-  checkpoints.
+- The control evaluator watcher was stopped after the cluster-return incident.
+  Recreate it on the migration cluster after a fresh RL job id exists.
 
 ## Matched Base-student control
 

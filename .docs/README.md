@@ -73,6 +73,37 @@ export WANDB_PROJECT=opd_alignment-vashisth
 export WANDB_ENTITY=nvidia
 ```
 
+### Current DFW-to-CMH migration
+
+On 2026-08-03, AWS DFW activated `cspu_cluster_return` and placed its entire
+324-node GPU fleet in maintenance. There is no usable DFW GPU partition or
+account/QOS bypass. Preserve the durable step-10 checkpoint, but do not queue
+new GPU work there.
+
+The evidenced migration target is AWS CMH (`aws-cmh-slurm-1`), reached through
+`aws-cmh-login-01` or `aws-cmh-login-02`. CMH has four-GPU ARM GB300 nodes
+(sm103), not GB200 (sm100). On a fresh CMH session, first verify:
+
+```bash
+sinfo -a
+sacctmgr show assoc where user="$USER"
+stat /scratch/fsw/portfolios/nemotron/projects/nemotron_rl_systems/users/$USER/opd_primerl/containers/opd-primerl-gb200-evals.sqsh
+```
+
+The image name is historical: prior CMH Prime-RL execution used that
+CMH-local image with a FlashAttention-2/no-FlashInfer runtime path. Do not copy
+the DFW image and assume ABI compatibility. Hash and smoke the CMH-local image,
+then run a one-step teacher/top-64/Prime checkpoint-resume validation before
+requesting the full allocation.
+
+The minimum durable migration payload is the pushed code, the 183.2-GB step-10
+trainer DCP, the exact 30B student snapshot, the exact 235B teacher snapshot,
+the processed DAPO data, and eval environments. The step-10 HF export is useful
+for evaluation but is not a substitute for the optimizer/scheduler DCP. Use
+the documented Data Mover route in
+`opd_curriculum/cluster-data-mover.md`; keep Starfleet credentials and browser
+PINs outside Git.
+
 Stage and fully verify these exact model repositories before requesting GPUs:
 
 - student: `Qwen/Qwen3-30B-A3B`;
@@ -96,7 +127,7 @@ The current DAPO arm uses:
 - temperature 1.0, no top-p or top-k sampling truncation;
 - 10 inference nodes (40 TP1 replicas), two trainer nodes (DP replicate 2,
   EP4), and one or two TP4 teacher-serving replicas. One replica is the
-  minimum allocation; two are used for the current step-10 continuation so
+  minimum allocation; two are planned for the next step-10 continuation so
   the remaining work fits inside the cluster's preemption-protection window;
 - full trainer-state checkpoints plus HF evaluation weights at steps 5, 10,
   15, 20, and 25;
