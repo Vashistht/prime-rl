@@ -1,6 +1,6 @@
 # Experiment status
 
-Last updated: 2026-08-02 23:25 PDT.
+Last updated: 2026-08-02 23:44 PDT.
 
 ## Code
 
@@ -102,9 +102,39 @@ Last updated: 2026-08-02 23:25 PDT.
   indexes 2,340 keys spanning model, optimizer, scheduler, and progress state.
   The matching HF export has a `STABLE` marker. This confirms that the fresh
   run can be resumed exactly, unlike the interrupted weights-only run.
+- Trainer update 5 also completed cleanly: 2,048/2,048 trainable sequences,
+  zero errors, maximum policy lag 1, `0.8%` truncation, entropy `0.2668`, and
+  approximately 46.1K token/s (`14.6%` reported MFU).
 - The persistent evaluator watches stable steps 5/10/15/20/25 and submits
   serialized AIME25/AIME26/GPQA-Diamond avg@8 jobs. Step 5 evaluation is
-  running as Slurm `2827011`.
+  running as Slurm `2827011`: AIME25 completed at `72.50%` (174/240) and
+  AIME26 at `77.08%` (185/240), both with zero runtime errors; GPQA-Diamond is
+  in progress.
+
+## Queued matched post-trained old-data control
+
+- This fills the missing comparison cell: the same post-trained
+  `Qwen3-30B-A3B` student, original 235B teacher, corrected Eq. 5 objective,
+  and DAPO-run settings, changing only the training data to the complete local
+  math/STEM view used by the completed Base control.
+- The processed dataset has exactly 16,818 rows and SHA-256
+  `760b842c8d77127733534801fca43882959ff325fc85d895e507832520f6a95a`.
+  Its manifest reports zero canonical containment matches against AIME25,
+  AIME26, and GPQA-Diamond.
+- A dry render verified BF16, no FP8 or transfer quantization, corrected
+  `mopd_eq5`, teacher top-64, batch 2,048 as 1,024 prompts x 2 samples, LR
+  `1e-6`, 32,768 tokens, 25 updates, and resumable full-state checkpoints at
+  steps 5/10/15/20/25.
+- CPU-only launch coordinator Slurm `2827170` is pending on
+  `afterany:2826440`; therefore it consumes no GPU and cannot overlap the
+  current DAPO training allocation. Once released, it provisions and
+  live-validates a fresh one-node TP4 teacher before submitting the matched
+  12-node Prime-RL job. It does not reuse the current fixed teacher endpoint.
+- Future generated teacher jobs use Slurm `--no-requeue`: if preempted, they
+  now fail visibly instead of migrating hosts underneath fixed Prime-RL URLs.
+- A persistent watcher is already waiting for the queued RL job id and will
+  serialize AIME25/AIME26/GPQA-Diamond avg@8 evaluations for all five stable
+  checkpoints.
 
 ## Matched Base-student control
 
